@@ -1,0 +1,6 @@
+node_modules/
+# clasp の実体設定（scriptId を含むため各自で .clasp.json.example からコピーして作成）
+.clasp.json
+.clasprc.json
+npm-debug.log*
+.DS_Store
