@@ -1,0 +1,16 @@
+{
+  "name": "ggit",
+  "version": "0.1.0",
+  "description": "Googleドキュメント単体で動くGit風バージョン管理ツール（コンテナバインドGAS）",
+  "private": true,
+  "scripts": {
+    "login": "clasp login",
+    "push": "clasp push",
+    "pull": "clasp pull",
+    "open": "clasp open",
+    "logs": "clasp logs"
+  },
+  "devDependencies": {
+    "@google/clasp": "^2.4.2"
+  }
+}

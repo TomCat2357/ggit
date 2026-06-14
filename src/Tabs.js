@@ -1,0 +1,78 @@
+/**
+ * Tabs.js — タブ走査・本文 get/set ヘルパー。
+ *
+ * Google ドキュメントのタブは木構造（親タブ／子タブ）を成す。本モジュールは
+ * 全タブを再帰的に平坦化して扱うためのユーティリティを提供する。
+ *
+ * 参照: 設計仕様書 §4.2「タブ操作のAPI前提」。
+ */
+
+/** 全タブ（子タブ含む）を平坦な配列で返す。 */
+function Ggit_allTabs(doc) {
+  doc = doc || DocumentApp.getActiveDocument();
+  var out = [];
+  function rec(tabs) {
+    for (var i = 0; i < tabs.length; i++) {
+      out.push(tabs[i]);
+      rec(tabs[i].getChildTabs());
+    }
+  }
+  rec(doc.getTabs());
+  return out;
+}
+
+/** タブIDから Tab を引く。見つからなければ null。 */
+function Ggit_tabById(doc, id) {
+  var all = Ggit_allTabs(doc);
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].getId() === id) return all[i];
+  }
+  return null;
+}
+
+/** タブ本文のプレーンテキストを取得。 */
+function Ggit_tabText(tab) {
+  return tab.asDocumentTab().getBody().getText();
+}
+
+/** タブ本文をプレーンテキストで上書き。 */
+function Ggit_setTabText(tab, text) {
+  tab.asDocumentTab().getBody().setText(text);
+}
+
+/**
+ * Docs 拡張サービス経由で新規ドキュメントタブを生成し、生成された Tab を返す。
+ *
+ * `DocumentApp` 本体にタブ追加メソッドは無いため、Docs API の batchUpdate
+ * （addDocumentTab）を用いる（設計仕様書 §4.2）。レスポンス形状に依存せず
+ * 確実に新タブを特定するため、生成前後のタブID差分から新タブを割り出す。
+ */
+function Ggit_createTab(doc, title) {
+  var docId = doc.getId();
+  var before = {};
+  Ggit_allTabs(doc).forEach(function (t) { before[t.getId()] = true; });
+
+  try {
+    Docs.Documents.batchUpdate(
+      { requests: [{ addDocumentTab: { tabProperties: { title: title } } }] },
+      docId
+    );
+  } catch (e) {
+    throw new Error(
+      'タブ生成に失敗しました（addDocumentTab）。Docs 拡張サービスの有効化と、' +
+      '対象ドキュメントのタブAPI対応状況を確認してください。詳細: ' + e.message
+    );
+  }
+
+  // 反映済みの状態を取り直して新タブを特定する。
+  var fresh = DocumentApp.openById(docId);
+  var after = Ggit_allTabs(fresh);
+  for (var i = 0; i < after.length; i++) {
+    if (!before[after[i].getId()]) return after[i];
+  }
+  // フォールバック: 同名タブを探す。
+  for (var j = after.length - 1; j >= 0; j--) {
+    if (after[j].getTitle() === title) return after[j];
+  }
+  throw new Error('タブ生成後に新規タブを特定できませんでした。');
+}
