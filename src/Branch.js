@@ -26,9 +26,9 @@ function Ggit_branch(name) {
     throw new Error('分岐元タブに履歴がありません。先にコミットしてからブランチを作成してください。');
   }
 
-  var srcText = Ggit_tabText(srcTab);
+  var srcSnap = Ggit_serializeTab(srcTab);
   var newTab = Ggit_createTab(doc, name);
-  Ggit_setTabText(newTab, srcText);
+  Ggit_restoreTab(newTab, srcSnap); // テキストだけでなく書式ごと複製する
 
   store.branches[newTab.getId()] = { head: br.head, name: name };
   Ggit_storeSave(doc, store);
@@ -54,7 +54,8 @@ function Ggit_checkout(targetTabId) {
     clean: null
   };
   if (br) {
-    report.clean = (Ggit_materialize(store, br.head) === Ggit_tabText(tab));
+    // 書式差も「未コミットの変更」に反映するため、スナップショット同士で比較する。
+    report.clean = (Ggit_materialize(store, br.head) === Ggit_serializeTab(tab));
   }
   return report;
 }

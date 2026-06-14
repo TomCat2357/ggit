@@ -181,8 +181,9 @@ function Ggit_merge(sourceTabId) {
     return { conflict: false, commitId: null, upToDate: true };
   }
 
-  var baseText = lca ? Ggit_materialize(store, lca) : '';
-  var srcText = Ggit_materialize(store, srcHead);
+  // 3-way マージはプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var baseText = lca ? Ggit_plainOf(Ggit_materialize(store, lca)) : '';
+  var srcText = Ggit_plainOf(Ggit_materialize(store, srcHead));
   var curText = Ggit_tabText(curTab); // 作業中本文（未コミット編集も取り込む）
 
   var merged = Ggit_diff3(
@@ -194,9 +195,12 @@ function Ggit_merge(sourceTabId) {
   }
 
   // クリーンマージ → parent2 付きマージコミットを記録。
+  // 合流結果（プレーン）を書き戻した後のタブをシリアライズし、全コミットを
+  // 同一のスナップショット表現で統一する（checkout 整合判定・後続 commit の比較が安定）。
   var ts = Ggit_timestamp();
   var msg = 'Merge ' + (srcBr.name || sourceTabId) + ' into ' + (curBr.name || curTabId);
-  var id = Ggit_commitId(store, curTabId, curHead, ts, merged.text);
+  var snap = Ggit_serializeTab(curTab);
+  var id = Ggit_commitId(store, curTabId, curHead, ts, snap);
   store.objects[id] = {
     id: id,
     branch: curTabId,
@@ -205,7 +209,7 @@ function Ggit_merge(sourceTabId) {
     message: msg,
     author: Ggit_author(),
     timestamp: ts,
-    payload: Ggit_makePayload(store, curHead, merged.text)
+    payload: Ggit_makePayload(store, curHead, snap)
   };
   store.branches[curTabId] = { head: id, name: curTab.getTitle() };
   Ggit_storeSave(doc, store);
