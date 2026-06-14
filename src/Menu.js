@@ -228,7 +228,8 @@ function ggitUI_about() {
     'タブをブランチに見立て、commit / log / diff / branch / checkout / merge を提供します。<br><br>' +
     'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。' +
     '<code>.vcs</code> タブは手動編集しないでください。<br>' +
-    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3）。' +
+    'commit は本文の書式（文字・段落書式）も記録し、branch では書式ごと復元します。' +
+    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +
     '</div>';
   Ggit_showModal(html, 'About ggit', 480, 220);
 }

@@ -11,6 +11,8 @@
 function _test_all() {
   _test_hash();
   _test_snapshotRoundTrip();
+  _test_plainOf();
+  _test_snapshotFormatString();
   _test_mergeNoConflict();
   _test_mergeConflict();
   _test_lca();
@@ -70,6 +72,43 @@ function _test_snapshotRoundTrip() {
     p = lastId;
   }
   _ok('長い連鎖でも復元一致', Ggit_materialize(store, lastId) === t);
+}
+
+/** Ggit_plainOf の新形式抽出と旧プレーン payload 後方互換（純粋関数）。 */
+function _test_plainOf() {
+  var newSnap = JSON.stringify({ v: 1, text: 'a\nb', fmt: { runs: [], paras: [] } });
+  _ok('plainOf 新形式→text', Ggit_plainOf(newSnap) === 'a\nb');
+  _ok('plainOf 旧プレーン互換', Ggit_plainOf('line1\nline2') === 'line1\nline2');
+  _ok('plainOf 数値風プレーン', Ggit_plainOf('123') === '123');
+  _ok('plainOf JSON風プレーン', Ggit_plainOf('{"a":1}') === '{"a":1}');
+}
+
+/**
+ * payload パイプライン（makePayload/materialize）が書式付きスナップショット文字列でも
+ * round-trip すること、および「テキスト同一・書式のみ差」が別スナップショットになることを確認。
+ */
+function _test_snapshotFormatString() {
+  var store = { version: 1, objects: {}, branches: {} };
+  var branch = 't.fmt';
+  function commit(parent, snap) {
+    var ts = '2026-01-01T00:00:00+09:00';
+    var id = Ggit_commitId(store, branch, parent, ts + snap, snap);
+    store.objects[id] = {
+      id: id, branch: branch, parent: parent, parent2: null,
+      message: 'm', author: 'x', timestamp: ts,
+      payload: Ggit_makePayload(store, parent, snap)
+    };
+    return id;
+  }
+  var snapA = JSON.stringify({ v: 1, text: 'hello\nworld', fmt: { runs: [{ s: 0, e: 4, a: { BOLD: true } }], paras: [{ i: 0, a: {} }] } });
+  var snapB = JSON.stringify({ v: 1, text: 'hello\nworld', fmt: { runs: [{ s: 0, e: 4, a: { ITALIC: true } }], paras: [{ i: 0, a: {} }] } });
+
+  var id1 = commit(null, snapA);
+  var id2 = commit(id1, snapB);
+  _ok('snapshot文字列 round-trip A', Ggit_materialize(store, id1) === snapA);
+  _ok('snapshot文字列 round-trip B', Ggit_materialize(store, id2) === snapB);
+  _ok('書式のみ差で別スナップショット', snapA !== snapB);
+  _ok('plainOf は同一テキスト', Ggit_plainOf(snapA) === Ggit_plainOf(snapB));
 }
 
 function _test_mergeNoConflict() {

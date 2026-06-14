@@ -35,18 +35,18 @@ function Ggit_commit(message) {
     throw new Error('.vcs メタタブはコミットできません。対象のタブを選択してください。');
   }
 
-  var text = Ggit_tabText(tab);
+  var snap = Ggit_serializeTab(tab); // テキスト＋書式の構造化スナップショット
   var store = Ggit_storeLoad(doc);
   var br = store.branches[tabId];
   var parent = br ? br.head : null;
 
-  if (parent && Ggit_materialize(store, parent) === text) {
+  if (parent && Ggit_materialize(store, parent) === snap) {
     throw new Error('変更がありません（前回コミットと同一の内容です）。');
   }
 
   var ts = Ggit_timestamp();
-  var id = Ggit_commitId(store, tabId, parent, ts, text);
-  var payload = Ggit_makePayload(store, parent, text);
+  var id = Ggit_commitId(store, tabId, parent, ts, snap);
+  var payload = Ggit_makePayload(store, parent, snap);
 
   store.objects[id] = {
     id: id,

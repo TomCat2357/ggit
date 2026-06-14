@@ -15,7 +15,8 @@ function Ggit_diffHtml(textA, textB) {
 /** 2コミット間の差分HTML（UIダイアログから google.script.run で呼ばれる）。 */
 function Ggit_diffCommitsHtml(idA, idB) {
   var store = Ggit_storeLoad();
-  var a = Ggit_materialize(store, idA);
-  var b = Ggit_materialize(store, idB);
+  // diff はプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var a = Ggit_plainOf(Ggit_materialize(store, idA));
+  var b = Ggit_plainOf(Ggit_materialize(store, idB));
   return Ggit_diffHtml(a, b);
 }
