@@ -14,6 +14,9 @@ function _test_all() {
   _test_mergeNoConflict();
   _test_mergeConflict();
   _test_lca();
+  _test_restoreMaterialize();
+  _test_tabBodyEndIndex();
+  _test_diffDirection();
   Logger.log('--- self-test 完了 ---');
 }
 
@@ -88,6 +91,63 @@ function _test_mergeConflict() {
     Ggit_splitLines('x\nYOURS\nz'));
   _ok('merge 競合検出', m.conflict === true);
   _ok('merge 競合マーカー', m.text.indexOf('<<<<<<<') >= 0 && m.text.indexOf('>>>>>>>') >= 0);
+}
+
+/**
+ * preview / restore のデータ経路（Ggit_materialize）が各コミット本文を復元することを確認。
+ * Ggit_previewCommit / Ggit_restoreCommit はこの結果をそのままタブへ書く。
+ */
+function _test_restoreMaterialize() {
+  var store = { version: 1, objects: {}, branches: {} };
+  var branch = 't.restore';
+  var texts = ['v1\nbody', 'v1\nbody\nmore', 'v1-CHANGED\nbody\nmore'];
+  var ids = [];
+  var parent = null;
+  for (var i = 0; i < texts.length; i++) {
+    var ts = '2026-01-01T00:00:00+09:00';
+    var id = Ggit_commitId(store, branch, parent, ts + texts[i], texts[i]);
+    store.objects[id] = {
+      id: id, branch: branch, parent: parent, parent2: null,
+      message: 'm', author: 'x', timestamp: ts,
+      payload: Ggit_makePayload(store, parent, texts[i])
+    };
+    ids.push(id);
+    parent = id;
+  }
+  // 任意の過去コミットを「復元元」として正しい本文を取り出せること。
+  _ok('restore: 旧版本文を復元', Ggit_materialize(store, ids[0]) === texts[0]);
+  _ok('restore: 中間版本文を復元', Ggit_materialize(store, ids[1]) === texts[1]);
+  _ok('restore: 最新版本文を復元', Ggit_materialize(store, ids[2]) === texts[2]);
+}
+
+/**
+ * Ggit_tabBodyEndIndex_ が Docs.Documents.get レスポンス（モック）から、
+ * トップ階層タブ・子タブそれぞれの本文末尾 endIndex を返すことを確認。
+ */
+function _test_tabBodyEndIndex() {
+  var res = {
+    tabs: [
+      { tabId: 't.parent',
+        documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 42 }] } },
+        childTabs: [
+          { tabId: 't.child',
+            documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 7 }] } } }
+        ] }
+    ]
+  };
+  _ok('tabBodyEndIndex: トップ階層', Ggit_tabBodyEndIndex_(res, 't.parent') === 42);
+  _ok('tabBodyEndIndex: 子タブ', Ggit_tabBodyEndIndex_(res, 't.child') === 7);
+}
+
+/**
+ * Log のプレビュー差分は A=コミット, B=作業中。作業中で行を追加したとき、
+ * 着色HTMLに挿入（ins）スパンが現れることを確認。
+ */
+function _test_diffDirection() {
+  var committed = 'l1\nl2';
+  var working = 'l1\nl2\nl3-added';
+  var html = Ggit_diffHtml(committed, working);
+  _ok('diff方向: 作業中の追加が ins として現れる', html.indexOf('<ins') >= 0);
 }
 
 function _test_lca() {

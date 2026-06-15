@@ -28,11 +28,14 @@ function Ggit_branch(name) {
 
   var srcText = Ggit_tabText(srcTab);
   var newTab = Ggit_createTab(doc, name);
-  Ggit_setTabText(newTab, srcText);
+  var newTabId = newTab.getId();
+  // 新タブは openById 由来の別インスタンスに属するため、DocumentApp で書くと
+  // フラッシュ競合で本文が消えることがある。Docs API 経由で確実に書き込む。
+  Ggit_setTabTextApi(doc.getId(), newTabId, srcText);
 
-  store.branches[newTab.getId()] = { head: br.head, name: name };
+  store.branches[newTabId] = { head: br.head, name: name };
   Ggit_storeSave(doc, store);
-  return newTab.getId();
+  return newTabId;
 }
 
 /**

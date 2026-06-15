@@ -10,6 +10,8 @@
 function onOpen() {
   DocumentApp.getUi()
     .createMenu('ggit')
+    .addItem('Setup / 権限付与', 'ggitUI_setup')
+    .addSeparator()
     .addItem('Commit…', 'ggitUI_commit')
     .addItem('Log', 'ggitUI_log')
     .addItem('Diff…', 'ggitUI_diff')
@@ -67,6 +69,22 @@ function Ggit_uiListBranches(excludeActiveTabId) {
 
 /* ===================== メニューハンドラ ===================== */
 
+function ggitUI_setup() {
+  var ui = DocumentApp.getUi();
+  try {
+    var info = Ggit_authorize();
+    ui.alert('ggit setup',
+      '初期化が完了しました。\n' +
+      'ドキュメント: ' + info.title + '\n' +
+      'タブ数: ' + info.tabCount + '\n\n' +
+      'これで Commit などの操作が利用できます。\n' +
+      '※ 権限承認の直後はGASの仕様により最初の操作がキャンセルされることがあります。' +
+      'その場合は同じ操作をもう一度実行してください。', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit setup', '初期化中にエラー: ' + e.message, ui.ButtonSet.OK);
+  }
+}
+
 function ggitUI_commit() {
   var ui = DocumentApp.getUi();
   var res = ui.prompt('ggit commit', 'コミットメッセージを入力してください:', ui.ButtonSet.OK_CANCEL);
@@ -81,27 +99,92 @@ function ggitUI_commit() {
   }
 }
 
+/** 指定コミットの本文全文を返す（プレビュー用）。 */
+function Ggit_previewCommit(id) {
+  return Ggit_materialize(Ggit_storeLoad(), id);
+}
+
+/** 指定コミット本文と現在の作業本文（アクティブタブ）の差分HTML（A=コミット, B=作業中）。 */
+function Ggit_diffCommitVsWorkingHtml(id) {
+  var doc = DocumentApp.getActiveDocument();
+  var working = Ggit_tabText(doc.getActiveTab());
+  var committed = Ggit_materialize(Ggit_storeLoad(doc), id);
+  return Ggit_diffHtml(committed, working);
+}
+
+/**
+ * 指定コミットの本文をアクティブタブの作業本文へ復元する（自動コミットしない）。
+ * jj の working-copy モデルに合わせ、記録はユーザの明示 commit に委ねる。
+ * アクティブタブ＝単一インスタンスのため Docs API は不要。
+ */
+function Ggit_restoreCommit(id) {
+  var doc = DocumentApp.getActiveDocument();
+  var tab = doc.getActiveTab();
+  var meta = Ggit_metaTab(doc);
+  if (meta && tab.getId() === meta.getId()) {
+    throw new Error('.vcs メタタブには復元できません。対象タブを選択してください。');
+  }
+  var store = Ggit_storeLoad(doc);
+  if (!store.objects[id]) throw new Error('コミットが見つかりません: ' + id);
+  Ggit_setTabText(tab, Ggit_materialize(store, id));
+  return { restored: id, tabTitle: tab.getTitle() };
+}
+
 function ggitUI_log() {
   var commits = Ggit_uiListCommits();
-  var rows;
   if (!commits.length) {
-    rows = '<tr><td colspan="3" style="color:#888">コミットがありません。</td></tr>';
-  } else {
-    rows = commits.map(function (c) {
-      return '<tr>' +
-        '<td style="font-family:monospace;color:#1a73e8;white-space:nowrap">' + Ggit_esc(c.id) + '</td>' +
-        '<td>' + Ggit_esc(c.message) + '</td>' +
-        '<td style="color:#888;white-space:nowrap">' + Ggit_esc(c.timestamp) + '</td>' +
-        '</tr>';
-    }).join('');
+    Ggit_showModal(
+      '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:8px;color:#888">コミットがありません。</div>',
+      'ggit log', 480, 200);
+    return;
   }
+  var rows = commits.map(function (c) {
+    return '<div class="row" data-id="' + Ggit_esc(c.id) + '" onclick="sel(this)">' +
+      '<span style="font-family:monospace;color:#1a73e8">' + Ggit_esc(c.id) + '</span> ' +
+      Ggit_esc(c.message) +
+      '<div style="color:#888;font-size:11px">' + Ggit_esc(c.timestamp) + '</div></div>';
+  }).join('');
+
   var html =
-    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
-    '<table style="border-collapse:collapse;width:100%">' +
-    '<thead><tr style="text-align:left;border-bottom:1px solid #ddd">' +
-    '<th>id</th><th>message</th><th>timestamp</th></tr></thead>' +
-    '<tbody>' + rows + '</tbody></table></div>';
-  Ggit_showModal(html, 'ggit log', 640, 480);
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;display:flex;height:470px">' +
+    '<div style="width:38%;overflow:auto;border-right:1px solid #ddd">' + rows + '</div>' +
+    '<div style="flex:1;display:flex;flex-direction:column;padding:0 8px;min-width:0">' +
+    '<div style="margin:6px 0">' +
+    '<label><input type="radio" name="mode" value="content" checked onclick="render()">内容</label> ' +
+    '<label><input type="radio" name="mode" value="diff" onclick="render()">作業中との差分</label> ' +
+    '<button id="restore" onclick="restore()" disabled>この版に戻す</button>' +
+    '<span id="msg" style="color:#188038;margin-left:8px"></span></div>' +
+    '<div id="out" style="border:1px solid #ddd;padding:8px;flex:1;overflow:auto;' +
+    'white-space:pre-wrap;font-family:monospace">コミットを選択してください。</div>' +
+    '</div>' +
+    '<style>.row{padding:6px 8px;cursor:pointer;border-bottom:1px solid #eee}' +
+    '.row.on{background:#e8f0fe}</style>' +
+    '<script>' +
+    'var cur=null;' +
+    'function sel(el){' +
+    'var rs=document.querySelectorAll(".row");for(var i=0;i<rs.length;i++)rs[i].className="row";' +
+    'el.className="row on";cur=el.getAttribute("data-id");' +
+    'document.getElementById("restore").disabled=false;' +
+    'document.getElementById("msg").innerText="";render();}' +
+    'function render(){if(!cur)return;' +
+    'var mode=document.querySelector("input[name=mode]:checked").value;' +
+    'var out=document.getElementById("out");out.innerText="読み込み中…";' +
+    'if(mode==="content"){' +
+    'google.script.run.withSuccessHandler(function(t){out.innerText=t;})' +
+    '.withFailureHandler(function(e){out.innerText=e.message;}).Ggit_previewCommit(cur);' +
+    '}else{' +
+    'google.script.run.withSuccessHandler(function(h){out.innerHTML=h;})' +
+    '.withFailureHandler(function(e){out.innerText=e.message;}).Ggit_diffCommitVsWorkingHtml(cur);}}' +
+    'function restore(){if(!cur)return;' +
+    'if(!confirm("選択した版の内容をアクティブタブの本文に書き戻します。未コミットの編集は失われます。よろしいですか？"))return;' +
+    'document.getElementById("restore").disabled=true;' +
+    'google.script.run.withSuccessHandler(function(r){' +
+    'document.getElementById("msg").innerText="復元しました（"+r.restored+"）。必要なら Commit で記録してください。";' +
+    'document.getElementById("restore").disabled=false;})' +
+    '.withFailureHandler(function(e){document.getElementById("msg").innerText=e.message;' +
+    'document.getElementById("restore").disabled=false;}).Ggit_restoreCommit(cur);}' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit log', 820, 520);
 }
 
 function ggitUI_diff() {
