@@ -40,17 +40,37 @@ function Ggit_setTabText(tab, text) {
   tab.asDocumentTab().getBody().setText(text);
 }
 
+/** Docs API のドキュメントから全タブID（子タブ含む）を平坦に集める。 */
+function Ggit_docsTabIds(docId) {
+  var docRes = Docs.Documents.get(docId, { includeTabsContent: false });
+  var ids = [];
+  function rec(tabs) {
+    if (!tabs) return;
+    for (var i = 0; i < tabs.length; i++) {
+      var tp = tabs[i].tabProperties;
+      if (tp && tp.tabId) ids.push(tp.tabId);
+      rec(tabs[i].childTabs);
+    }
+  }
+  rec(docRes.tabs);
+  return ids;
+}
+
 /**
  * Docs 拡張サービス経由で新規ドキュメントタブを生成し、生成された Tab を返す。
  *
  * `DocumentApp` 本体にタブ追加メソッドは無いため、Docs API の batchUpdate
- * （addDocumentTab）を用いる（設計仕様書 §4.2）。レスポンス形状に依存せず
- * 確実に新タブを特定するため、生成前後のタブID差分から新タブを割り出す。
+ * （addDocumentTab）を用いる（設計仕様書 §4.2）。
+ *
+ * 新タブの特定は二段構えで行う:
+ *  1) batchUpdate と同じバックエンド（強整合）の Docs API で生成前後のタブID差分を取り、
+ *     新タブIDを確定する（レスポンス形状に依存しない）。
+ *  2) Docs API の書き込みが DocumentApp 側へ反映されるまで遅延し得るため、
+ *     反映を待ちながら（リトライ）新タブの DocumentApp.Tab を取得して返す。
  */
 function Ggit_createTab(doc, title) {
   var docId = doc.getId();
-  var before = {};
-  Ggit_allTabs(doc).forEach(function (t) { before[t.getId()] = true; });
+  var beforeIds = Ggit_docsTabIds(docId);
 
   try {
     Docs.Documents.batchUpdate(
@@ -64,15 +84,34 @@ function Ggit_createTab(doc, title) {
     );
   }
 
-  // 反映済みの状態を取り直して新タブを特定する。
-  var fresh = DocumentApp.openById(docId);
-  var after = Ggit_allTabs(fresh);
-  for (var i = 0; i < after.length; i++) {
-    if (!before[after[i].getId()]) return after[i];
+  // 1) Docs API（強整合）で新タブIDを確定する。
+  var newId = null;
+  var afterIds = Ggit_docsTabIds(docId);
+  for (var i = 0; i < afterIds.length; i++) {
+    if (beforeIds.indexOf(afterIds[i]) === -1) { newId = afterIds[i]; break; }
   }
-  // フォールバック: 同名タブを探す。
-  for (var j = after.length - 1; j >= 0; j--) {
-    if (after[j].getTitle() === title) return after[j];
+
+  // 2) DocumentApp 側へ反映されるまで待って Tab を取得する。
+  //    （openById は実行内キャッシュ／反映遅延の影響を受けるため、開き直しつつ待機する）
+  for (var attempt = 0; attempt < 6; attempt++) {
+    var fresh = DocumentApp.openById(docId);
+    var after = Ggit_allTabs(fresh);
+    if (newId) {
+      for (var k = 0; k < after.length; k++) {
+        if (after[k].getId() === newId) return after[k];
+      }
+    } else {
+      // newId 不明時のフォールバック: 同名タブ（末尾優先）。
+      for (var j = after.length - 1; j >= 0; j--) {
+        if (after[j].getTitle() === title) return after[j];
+      }
+    }
+    Utilities.sleep(400 * (attempt + 1)); // 0.4s,0.8s,...,2.4s（合計 ~8.4s 上限）
   }
-  throw new Error('タブ生成後に新規タブを特定できませんでした。');
+
+  throw new Error(
+    'タブは生成されましたが、DocumentApp 側への反映を確認できませんでした。' +
+    '少し待ってからページを再読み込みし、再度お試しください。' +
+    (newId ? '（新タブID: ' + newId + '）' : '')
+  );
 }

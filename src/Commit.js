@@ -2,7 +2,8 @@
  * Commit.js — commit / log。
  *
  * 設計仕様書 §6: commit はアクティブタブ本文をスナップショット化し、
- * 親＝当該タブの HEAD として新コミットを記録、ブランチ HEAD を更新する。
+ * 親＝現在地 working として新コミットを記録、working（現在地 @）を新コミットへ前進させる。
+ * Jujutsu と同様、ブックマークは commit では動かさない（明示操作でのみ移動）。
  */
 
 /** コミット作者（取得できなければ 'unknown'）。 */
@@ -37,20 +38,20 @@ function Ggit_commit(message) {
 
   var snap = Ggit_serializeTab(tab); // テキスト＋書式の構造化スナップショット
   var store = Ggit_storeLoad(doc);
-  var br = store.branches[tabId];
-  var parent = br ? br.head : null;
+
+  // 親＝現在地 working。初回（未確立）は parent=null。
+  var parent = Ggit_resolveWorking(doc, store);
 
   if (parent && Ggit_materialize(store, parent) === snap) {
     throw new Error('変更がありません（前回コミットと同一の内容です）。');
   }
 
   var ts = Ggit_timestamp();
-  var id = Ggit_commitId(store, tabId, parent, ts, snap);
+  var id = Ggit_commitId(store, parent, ts, snap);
   var payload = Ggit_makePayload(store, parent, snap);
 
   store.objects[id] = {
     id: id,
-    branch: tabId,
     parent: parent,
     parent2: null,
     message: message,
@@ -58,18 +59,16 @@ function Ggit_commit(message) {
     timestamp: ts,
     payload: payload
   };
-  store.branches[tabId] = { head: id, name: tab.getTitle() };
+  store.working = id; // 現在地 @ のみ前進（ブックマークは動かさない＝jj）
 
   Ggit_storeSave(doc, store);
   return id;
 }
 
-/** 指定タブ（省略時はアクティブタブ）の HEAD から親方向に辿ったコミット配列。 */
-function Ggit_logChain(store, tabId) {
-  var br = store.branches[tabId];
-  if (!br) return [];
+/** 指定コミットIDから親方向に辿ったコミット配列（フラットログ・status 用）。 */
+function Ggit_logChain(store, startId) {
   var out = [];
-  var id = br.head;
+  var id = startId || null;
   while (id) {
     var o = store.objects[id];
     if (!o) break;

@@ -154,56 +154,77 @@ function Ggit_findLCA(store, idA, idB) {
 }
 
 /**
- * sourceTabId のブランチを現在のアクティブタブへ 3-way マージする。
- * 結果（マージ後本文）を現タブへ書き戻し、{ conflict, commitId, upToDate } を返す。
- * 競合が無ければ parent2 付きのマージコミットを記録する。競合時はマーカー入り本文を
- * 書き戻し、コミットは作らず手動解決に委ねる。
+ * source（ブックマーク名 または コミットID）を現在地 working（作業タブ）へ 3-way マージする。
+ * 結果（マージ後本文）を作業タブへ書き戻し、
+ * { conflict, commitId, upToDate, fastForward, stashed } を返す。
+ *  - upToDate : マージ元が既に取り込み済み（変更なし）。
+ *  - fastForward : 現在地が マージ元の祖先 → コミットを作らず working を進める。
+ *  - 競合が無い分岐合流 → parent2 付きのマージコミットを記録し working を進める。
+ *  - 競合時 → マーカー入り本文を書き戻し、コミットは作らず手動解決に委ねる。
+ * jj 同様、いずれもブックマークは動かさない（working＝現在地のみ移動）。
  */
-function Ggit_merge(sourceTabId) {
+function Ggit_merge(source) {
   var doc = DocumentApp.getActiveDocument();
-  var curTab = doc.getActiveTab();
-  var curTabId = curTab.getId();
-  if (curTabId === sourceTabId) {
-    throw new Error('同一タブはマージできません。');
+  var tab = doc.getActiveTab();
+  var tabId = tab.getId();
+
+  var meta = Ggit_metaTab(doc);
+  if (meta && tabId === meta.getId()) {
+    throw new Error('.vcs メタタブ上ではマージできません。対象のタブを選択してください。');
   }
 
   var store = Ggit_storeLoad(doc);
-  var curBr = store.branches[curTabId];
-  var srcBr = store.branches[sourceTabId];
-  if (!curBr) throw new Error('現在のタブに履歴がありません。先にコミットしてください。');
-  if (!srcBr) throw new Error('マージ元タブに履歴がありません。');
+  var curHead = Ggit_resolveWorking(doc, store);
+  if (!curHead) throw new Error('現在地に履歴がありません。先にコミットしてください。');
 
-  var curHead = curBr.head, srcHead = srcBr.head;
+  // source をコミットIDへ解決（ブックマーク名優先）。
+  var srcHead = store.bookmarks.hasOwnProperty(source) ? store.bookmarks[source] : source;
+  if (!store.objects.hasOwnProperty(srcHead)) {
+    throw new Error('マージ元が見つかりません: ' + source);
+  }
+  if (srcHead === curHead) throw new Error('現在地自身はマージできません。');
+
   var lca = Ggit_findLCA(store, curHead, srcHead);
 
   // マージ元が既に現在の祖先に含まれる（取り込み済み）。
   if (lca === srcHead) {
-    return { conflict: false, commitId: null, upToDate: true };
+    return { conflict: false, commitId: null, upToDate: true, fastForward: false, stashed: false };
+  }
+
+  // 早送り（fast-forward）: 現在地が マージ元の祖先 なら、コミットを作らず working を進める。
+  if (lca === curHead) {
+    var curSnapNow = Ggit_serializeTab(tab);
+    var ffStashed = Ggit_stashIfNeeded(
+      store, tab, curHead, curSnapNow, 'マージ（早送り）前の自動スタッシュ');
+    Ggit_restoreTab(tab, Ggit_materialize(store, srcHead)); // テキスト＋書式ごと取り込む
+    store.working = srcHead;
+    Ggit_storeSave(doc, store);
+    return { conflict: false, commitId: srcHead, upToDate: false, fastForward: true, stashed: ffStashed };
   }
 
   // 3-way マージはプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
   var baseText = lca ? Ggit_plainOf(Ggit_materialize(store, lca)) : '';
   var srcText = Ggit_plainOf(Ggit_materialize(store, srcHead));
-  var curText = Ggit_tabText(curTab); // 作業中本文（未コミット編集も取り込む）
+  var curText = Ggit_tabText(tab); // 作業中本文（未コミット編集も取り込む）
 
   var merged = Ggit_diff3(
     Ggit_splitLines(baseText), Ggit_splitLines(curText), Ggit_splitLines(srcText));
-  Ggit_setTabText(curTab, merged.text);
+  Ggit_setTabText(tab, merged.text);
 
   if (merged.conflict) {
-    return { conflict: true, commitId: null, upToDate: false };
+    return { conflict: true, commitId: null, upToDate: false, fastForward: false, stashed: false };
   }
 
   // クリーンマージ → parent2 付きマージコミットを記録。
   // 合流結果（プレーン）を書き戻した後のタブをシリアライズし、全コミットを
-  // 同一のスナップショット表現で統一する（checkout 整合判定・後続 commit の比較が安定）。
+  // 同一のスナップショット表現で統一する（移動整合判定・後続 commit の比較が安定）。
   var ts = Ggit_timestamp();
-  var msg = 'Merge ' + (srcBr.name || sourceTabId) + ' into ' + (curBr.name || curTabId);
-  var snap = Ggit_serializeTab(curTab);
-  var id = Ggit_commitId(store, curTabId, curHead, ts, snap);
+  var srcLabel = store.bookmarks.hasOwnProperty(source) ? source : srcHead;
+  var msg = 'Merge ' + srcLabel + ' into ' + curHead;
+  var snap = Ggit_serializeTab(tab);
+  var id = Ggit_commitId(store, curHead, ts, snap);
   store.objects[id] = {
     id: id,
-    branch: curTabId,
     parent: curHead,
     parent2: srcHead,
     message: msg,
@@ -211,7 +232,7 @@ function Ggit_merge(sourceTabId) {
     timestamp: ts,
     payload: Ggit_makePayload(store, curHead, snap)
   };
-  store.branches[curTabId] = { head: id, name: curTab.getTitle() };
+  store.working = id;
   Ggit_storeSave(doc, store);
-  return { conflict: false, commitId: id, upToDate: false };
+  return { conflict: false, commitId: id, upToDate: false, fastForward: false, stashed: false };
 }

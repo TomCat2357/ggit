@@ -1,3 +1,9 @@
+// ============================================================
+// ggit combined bundle - deploy.ps1 により自動生成（直接編集しないこと）
+// 元ファイル: src/ 配下の .js を統合
+// ============================================================
+
+// ----- File: src/vendor/DiffMatchPatch.js -----
 /**
  * Diff Match and Patch
  * Copyright 2018 The diff-match-patch Authors.
@@ -2234,256 +2240,114 @@ this['DIFF_DELETE'] = DIFF_DELETE;
 this['DIFF_INSERT'] = DIFF_INSERT;
 /** @suppress {globalThis} */
 this['DIFF_EQUAL'] = DIFF_EQUAL;
+
+// ----- File: src/Bookmark.js -----
 /**
- * Hash.js — コミットID（SHA-256 短縮ハッシュ）。
+ * Bookmark.js — bookmark（設定/移動/削除）と goto（現在地の移動）。
  *
- * 設計仕様書 §5.1: 本文シリアライズの SHA-256 を短縮してコミットIDとする。
+ * Jujutsu 流モデル: 現在地 working はコミットID（匿名ヘッド @）。ブックマークは手動で付ける
+ * 名前付きポインタで、commit では自動前進しない（明示的に set/move したときだけ動く）。
+ * 作業コピーはアクティブタブ1枚で、goto はその本文をその場で対象コミットの内容に入れ替える
+ * （GAS のタブ生成・別インスタンス書き込み・アクティブタブ切替の制約を回避する。付録B/C）。
  */
 
-/** 文字列の SHA-256 を小文字 hex で返す。 */
-function Ggit_sha256Hex(input) {
-  var bytes = Utilities.computeDigest(
-    Utilities.DigestAlgorithm.SHA_256, input, Utilities.Charset.UTF_8);
-  var hex = '';
-  for (var i = 0; i < bytes.length; i++) {
-    var b = (bytes[i] + 256) % 256; // byte は符号付きのため 0..255 に正規化
-    var h = b.toString(16);
-    hex += (h.length === 1 ? '0' : '') + h;
+/**
+ * ブックマークを設定/移動する（git branch -f 相当・jj bookmark set）。
+ * commitId 既定＝現在地 working。既存同名は移動になる。設定後の { name, commitId } を返す。
+ */
+function Ggit_bookmarkSet(name, commitId) {
+  name = (name || '').trim();
+  if (!name) throw new Error('ブックマーク名が空です。');
+  if (name === GGIT_META_TITLE) {
+    throw new Error('「' + GGIT_META_TITLE + '」は予約名です。別の名前を指定してください。');
   }
-  return hex;
+
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
+
+  var target = commitId || Ggit_resolveWorking(doc, store);
+  if (!target) {
+    throw new Error('指す先のコミットがありません。先にコミットしてください。');
+  }
+  if (!store.objects.hasOwnProperty(target)) {
+    throw new Error('コミットが見つかりません: ' + target);
+  }
+
+  store.bookmarks[name] = target;
+  Ggit_storeSave(doc, store);
+  return { name: name, commitId: target };
 }
 
-/**
- * コミットIDを算出する。既存IDと衝突する短縮形は桁を伸ばして一意化する。
- * 入力は branch / parent / timestamp / 本文全文を連結したもの。
- */
-function Ggit_commitId(store, branch, parent, timestamp, fullText) {
-  var hex = Ggit_sha256Hex(branch + '\n' + (parent || '') + '\n' + timestamp + '\n' + fullText);
-  for (var len = 7; len < hex.length; len++) {
-    var cand = hex.substring(0, len);
-    if (!store.objects[cand]) return cand;
+/** ブックマークを削除する（git branch -d 相当）。戻り値: { name, deleted }。 */
+function Ggit_bookmarkDelete(name) {
+  name = (name || '').trim();
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
+  if (!store.bookmarks.hasOwnProperty(name)) {
+    throw new Error('ブックマークが見つかりません: ' + name);
   }
-  return hex;
+  delete store.bookmarks[name];
+  Ggit_storeSave(doc, store);
+  return { name: name, deleted: true };
 }
-/**
- * Tabs.js — タブ走査・本文 get/set ヘルパー。
- *
- * Google ドキュメントのタブは木構造（親タブ／子タブ）を成す。本モジュールは
- * 全タブを再帰的に平坦化して扱うためのユーティリティを提供する。
- *
- * 参照: 設計仕様書 §4.2「タブ操作のAPI前提」。
- */
 
-/** 全タブ（子タブ含む）を平坦な配列で返す。 */
-function Ggit_allTabs(doc) {
-  doc = doc || DocumentApp.getActiveDocument();
+/** 全ブックマークを {name, commitId} の配列で返す。 */
+function Ggit_bookmarkList() {
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
   var out = [];
-  function rec(tabs) {
-    for (var i = 0; i < tabs.length; i++) {
-      out.push(tabs[i]);
-      rec(tabs[i].getChildTabs());
-    }
+  for (var name in store.bookmarks) {
+    if (store.bookmarks.hasOwnProperty(name)) out.push({ name: name, commitId: store.bookmarks[name] });
   }
-  rec(doc.getTabs());
   return out;
 }
 
-/** タブIDから Tab を引く。見つからなければ null。 */
-function Ggit_tabById(doc, id) {
-  var all = Ggit_allTabs(doc);
-  for (var i = 0; i < all.length; i++) {
-    if (all[i].getId() === id) return all[i];
-  }
-  return null;
-}
-
-/** タブ本文のプレーンテキストを取得。 */
-function Ggit_tabText(tab) {
-  return tab.asDocumentTab().getBody().getText();
-}
-
-/** タブ本文をプレーンテキストで上書き。 */
-function Ggit_setTabText(tab, text) {
-  tab.asDocumentTab().getBody().setText(text);
-}
-
 /**
- * Docs 拡張サービス経由で新規ドキュメントタブを生成し、生成された Tab を返す。
- *
- * `DocumentApp` 本体にタブ追加メソッドは無いため、Docs API の batchUpdate
- * （addDocumentTab）を用いる（設計仕様書 §4.2）。レスポンス形状に依存せず
- * 確実に新タブを特定するため、生成前後のタブID差分から新タブを割り出す。
+ * 現在地 working を target（ブックマーク名 または コミットID）へ移動する（jj edit / git checkout 相当）。
+ * 作業タブ本文を対象コミットの内容（テキスト＋書式）で置き換え、置き換えで失われる未コミット内容は
+ * スタッシュ（仮コミット）へ退避する。戻り値: { target, commitId, stashed }。
  */
-function Ggit_createTab(doc, title) {
-  var docId = doc.getId();
-  var before = {};
-  Ggit_allTabs(doc).forEach(function (t) { before[t.getId()] = true; });
+function Ggit_goto(target) {
+  var doc = DocumentApp.getActiveDocument();
+  var tab = doc.getActiveTab();
 
-  try {
-    Docs.Documents.batchUpdate(
-      { requests: [{ addDocumentTab: { tabProperties: { title: title } } }] },
-      docId
-    );
-  } catch (e) {
-    throw new Error(
-      'タブ生成に失敗しました（addDocumentTab）。Docs 拡張サービスの有効化と、' +
-      '対象ドキュメントのタブAPI対応状況を確認してください。詳細: ' + e.message
-    );
+  var meta = Ggit_metaTab(doc);
+  if (meta && tab.getId() === meta.getId()) {
+    throw new Error('.vcs メタタブ上では移動できません。対象のタブを選択してください。');
   }
 
-  // 反映済みの状態を取り直して新タブを特定する。
-  var fresh = DocumentApp.openById(docId);
-  var after = Ggit_allTabs(fresh);
-  for (var i = 0; i < after.length; i++) {
-    if (!before[after[i].getId()]) return after[i];
-  }
-  // フォールバック: 同名タブを探す。
-  for (var j = after.length - 1; j >= 0; j--) {
-    if (after[j].getTitle() === title) return after[j];
-  }
-  throw new Error('タブ生成後に新規タブを特定できませんでした。');
-}
-/**
- * Store.js — オブジェクトストア（コミットグラフ）の永続化。
- *
- * 配置は設計仕様書 §5.2 の「案A」を採用し、`.vcs` というタイトルの
- * ドキュメントタブ本文に JSON 文字列としてストアを格納する。
- *
- * ストア構造:
- * {
- *   "version": 1,
- *   "objects":  { <commitId>: <commitObject>, ... },
- *   "branches": { <tabId>: { "head": <commitId>, "name": <string> }, ... }
- * }
- */
+  var store = Ggit_storeLoad(doc);
 
-var GGIT_META_TITLE = '.vcs';
-
-/** `.vcs` メタタブを返す（無ければ null）。 */
-function Ggit_metaTab(doc) {
-  var all = Ggit_allTabs(doc);
-  for (var i = 0; i < all.length; i++) {
-    if (all[i].getTitle() === GGIT_META_TITLE) return all[i];
+  // target をコミットIDへ解決（ブランチ名優先、無ければコミットIDとみなす）。
+  var commitId = store.bookmarks.hasOwnProperty(target) ? store.bookmarks[target] : target;
+  if (!store.objects.hasOwnProperty(commitId)) {
+    throw new Error('移動先が見つかりません: ' + target);
   }
-  return null;
+
+  var cur = Ggit_resolveWorking(doc, store);
+  var targetSnap = Ggit_materialize(store, commitId);
+  var curSnap = Ggit_serializeTab(tab);
+
+  var stashed = false;
+  if (curSnap !== targetSnap) {
+    // 現在の未コミット内容を退避してから対象コミットの内容を復元する。
+    stashed = Ggit_stashIfNeeded(
+      store, tab, cur, curSnap,
+      '移動前の自動スタッシュ' + (cur ? '（' + cur + '）' : ''));
+    Ggit_restoreTab(tab, targetSnap); // テキスト＋書式ごと入れ替え
+  }
+  store.working = commitId;
+  Ggit_storeSave(doc, store);
+  return { target: target, commitId: commitId, stashed: stashed };
 }
 
-/** 空のストアを生成。 */
-function Ggit_emptyStore() {
-  return { version: 1, objects: {}, branches: {} };
-}
-
-/** メタタブからストアを読み込む（無ければ空ストア）。 */
-function Ggit_storeLoad(doc) {
-  doc = doc || DocumentApp.getActiveDocument();
-  var t = Ggit_metaTab(doc);
-  if (!t) return Ggit_emptyStore();
-  var raw = Ggit_tabText(t).trim();
-  if (!raw) return Ggit_emptyStore();
-  var s;
-  try {
-    s = JSON.parse(raw);
-  } catch (e) {
-    throw new Error('.vcs メタタブのJSON解析に失敗しました（手動編集の可能性）: ' + e.message);
-  }
-  s.version = s.version || 1;
-  s.objects = s.objects || {};
-  s.branches = s.branches || {};
-  return s;
-}
-
-/** ストアをメタタブへ書き戻す（メタタブが無ければ生成）。 */
-function Ggit_storeSave(doc, store) {
-  doc = doc || DocumentApp.getActiveDocument();
-  var t = Ggit_metaTab(doc);
-  if (!t) {
-    t = Ggit_createTab(doc, GGIT_META_TITLE);
-  }
-  Ggit_setTabText(t, JSON.stringify(store));
-}
-/**
- * Snapshot.js — payload（full/delta）の生成・復元と gzip+Base64 圧縮。
- *
- * 設計仕様書 §5.1 / §5.3:
- *  - payload.type = "full"  … 本文全文を gzip+Base64
- *  - payload.type = "delta" … 親→当該コミットの diff-match-patch パッチを gzip+Base64
- *  - 一定間隔でフルスナップショット（基準点）を挿入し、復元時の差分連鎖を短く保つ。
- */
-
-/** delta が連続する上限。これを超える前にフルスナップショットを挿入する。 */
-var GGIT_FULL_INTERVAL = 20;
-
-/** テキストを gzip+Base64 で圧縮。 */
-function Ggit_gzipB64(text) {
-  var gz = Utilities.gzip(Utilities.newBlob(text, 'text/plain'));
-  return Utilities.base64Encode(gz.getBytes());
-}
-
-/** gzip+Base64 を復号してテキストへ戻す。 */
-function Ggit_gunzipB64(b64) {
-  var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'application/x-gzip');
-  return Utilities.ungzip(blob).getDataAsString('UTF-8');
-}
-
-/** parentId から遡り、直近のフルスナップショットまでの delta 連続数を返す。 */
-function Ggit_deltasSinceFull(store, parentId) {
-  var n = 0, id = parentId;
-  while (id) {
-    var o = store.objects[id];
-    if (!o) break;
-    if (o.payload.type === 'full') break;
-    n++;
-    id = o.parent;
-  }
-  return n;
-}
-
-/**
- * 親と本文から payload を生成する。
- * 親が無い、または delta 連鎖が上限間際なら full、それ以外は delta。
- */
-function Ggit_makePayload(store, parentId, fullText) {
-  if (!parentId) {
-    return { type: 'full', data: Ggit_gzipB64(fullText) };
-  }
-  if (Ggit_deltasSinceFull(store, parentId) >= GGIT_FULL_INTERVAL - 1) {
-    return { type: 'full', data: Ggit_gzipB64(fullText) };
-  }
-  var parentText = Ggit_materialize(store, parentId);
-  var dmp = new diff_match_patch();
-  var patches = dmp.patch_make(parentText, fullText);
-  return { type: 'delta', data: Ggit_gzipB64(dmp.patch_toText(patches)) };
-}
-
-/**
- * 指定コミットの本文全文を復元する。
- * コミットから親方向へ直近の full まで遡り、full 本文に delta を順方向適用する。
- */
-function Ggit_materialize(store, id) {
-  var chain = [];
-  var cur = id;
-  while (cur) {
-    var o = store.objects[cur];
-    if (!o) throw new Error('オブジェクトが見つかりません: ' + cur);
-    chain.push(o);
-    if (o.payload.type === 'full') break;
-    cur = o.parent;
-  }
-  chain.reverse(); // [full(基準点), delta, delta, ... , target]
-
-  var text = Ggit_gunzipB64(chain[0].payload.data);
-  var dmp = new diff_match_patch();
-  for (var i = 1; i < chain.length; i++) {
-    var patches = dmp.patch_fromText(Ggit_gunzipB64(chain[i].payload.data));
-    text = dmp.patch_apply(patches, text)[0];
-  }
-  return text;
-}
+// ----- File: src/Commit.js -----
 /**
  * Commit.js — commit / log。
  *
  * 設計仕様書 §6: commit はアクティブタブ本文をスナップショット化し、
- * 親＝当該タブの HEAD として新コミットを記録、ブランチ HEAD を更新する。
+ * 親＝現在地 working として新コミットを記録、working（現在地 @）を新コミットへ前進させる。
+ * Jujutsu と同様、ブックマークは commit では動かさない（明示操作でのみ移動）。
  */
 
 /** コミット作者（取得できなければ 'unknown'）。 */
@@ -2516,22 +2380,22 @@ function Ggit_commit(message) {
     throw new Error('.vcs メタタブはコミットできません。対象のタブを選択してください。');
   }
 
-  var text = Ggit_tabText(tab);
+  var snap = Ggit_serializeTab(tab); // テキスト＋書式の構造化スナップショット
   var store = Ggit_storeLoad(doc);
-  var br = store.branches[tabId];
-  var parent = br ? br.head : null;
 
-  if (parent && Ggit_materialize(store, parent) === text) {
+  // 親＝現在地 working。初回（未確立）は parent=null。
+  var parent = Ggit_resolveWorking(doc, store);
+
+  if (parent && Ggit_materialize(store, parent) === snap) {
     throw new Error('変更がありません（前回コミットと同一の内容です）。');
   }
 
   var ts = Ggit_timestamp();
-  var id = Ggit_commitId(store, tabId, parent, ts, text);
-  var payload = Ggit_makePayload(store, parent, text);
+  var id = Ggit_commitId(store, parent, ts, snap);
+  var payload = Ggit_makePayload(store, parent, snap);
 
   store.objects[id] = {
     id: id,
-    branch: tabId,
     parent: parent,
     parent2: null,
     message: message,
@@ -2539,18 +2403,16 @@ function Ggit_commit(message) {
     timestamp: ts,
     payload: payload
   };
-  store.branches[tabId] = { head: id, name: tab.getTitle() };
+  store.working = id; // 現在地 @ のみ前進（ブックマークは動かさない＝jj）
 
   Ggit_storeSave(doc, store);
   return id;
 }
 
-/** 指定タブ（省略時はアクティブタブ）の HEAD から親方向に辿ったコミット配列。 */
-function Ggit_logChain(store, tabId) {
-  var br = store.branches[tabId];
-  if (!br) return [];
+/** 指定コミットIDから親方向に辿ったコミット配列（フラットログ・status 用）。 */
+function Ggit_logChain(store, startId) {
   var out = [];
-  var id = br.head;
+  var id = startId || null;
   while (id) {
     var o = store.objects[id];
     if (!o) break;
@@ -2559,66 +2421,8 @@ function Ggit_logChain(store, tabId) {
   }
   return out;
 }
-/**
- * Branch.js — branch / checkout。
- *
- * 設計仕様書 §6:
- *  - branch: addDocumentTab で新タブを生成し分岐元内容を複製。新タブHEAD＝分岐元コミット。
- *  - checkout: プログラムからのアクティブタブ切替はAPI制約があるため、整合性確認に留め、
- *    UI上のタブ選択を促す（§9 既知制約）。
- */
 
-/**
- * アクティブタブを分岐元として新ブランチ（タブ）を作成する。新タブIDを返す。
- */
-function Ggit_branch(name) {
-  var doc = DocumentApp.getActiveDocument();
-  var srcTab = doc.getActiveTab();
-  var srcId = srcTab.getId();
-
-  var meta = Ggit_metaTab(doc);
-  if (meta && srcId === meta.getId()) {
-    throw new Error('.vcs メタタブからは分岐できません。');
-  }
-
-  var store = Ggit_storeLoad(doc);
-  var br = store.branches[srcId];
-  if (!br) {
-    throw new Error('分岐元タブに履歴がありません。先にコミットしてからブランチを作成してください。');
-  }
-
-  var srcText = Ggit_tabText(srcTab);
-  var newTab = Ggit_createTab(doc, name);
-  Ggit_setTabText(newTab, srcText);
-
-  store.branches[newTab.getId()] = { head: br.head, name: name };
-  Ggit_storeSave(doc, store);
-  return newTab.getId();
-}
-
-/**
- * checkout: 切替自体はUI操作（タブクリック）が前提。本関数は対象タブの存在と、
- * HEAD と本文の整合性を確認したレポートを返す。
- */
-function Ggit_checkout(targetTabId) {
-  var doc = DocumentApp.getActiveDocument();
-  var tab = Ggit_tabById(doc, targetTabId);
-  if (!tab) throw new Error('指定タブが見つかりません。');
-
-  var store = Ggit_storeLoad(doc);
-  var br = store.branches[targetTabId];
-  var report = {
-    tabId: targetTabId,
-    title: tab.getTitle(),
-    head: br ? br.head : null,
-    tracked: !!br,
-    clean: null
-  };
-  if (br) {
-    report.clean = (Ggit_materialize(store, br.head) === Ggit_tabText(tab));
-  }
-  return report;
-}
+// ----- File: src/Diff.js -----
 /**
  * Diff.js — テキスト差分表示。
  *
@@ -2636,10 +2440,618 @@ function Ggit_diffHtml(textA, textB) {
 /** 2コミット間の差分HTML（UIダイアログから google.script.run で呼ばれる）。 */
 function Ggit_diffCommitsHtml(idA, idB) {
   var store = Ggit_storeLoad();
-  var a = Ggit_materialize(store, idA);
-  var b = Ggit_materialize(store, idB);
+  // diff はプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var a = Ggit_plainOf(Ggit_materialize(store, idA));
+  var b = Ggit_plainOf(Ggit_materialize(store, idB));
   return Ggit_diffHtml(a, b);
 }
+
+// ----- File: src/Graph.js -----
+/**
+ * Graph.js — コミットDAGの収集と ASCII レーングラフ描画（純粋関数）。
+ *
+ * 要望2「ブランチを意識した表示」に対応する。A→B→C で B に戻って B→D と分岐すると
+ * 2つの匿名ヘッド（葉）ができる。これを git log --graph 風の縦レーンで可視化する。
+ *
+ * すべて純粋関数（GAS ランタイム非依存）なので SelfTest でユニット検証できる。
+ * UI（Menu.js）は Ggit_collectNodes → Ggit_graphLines の結果を等幅フォントで描画する。
+ */
+
+/**
+ * store.objects 全体を描画用ノード配列へ整形する。
+ * 子が親より前に来る順（おおむね新しい順）に並べる（レーン割当が前提とする向き）。
+ * 各ノード: { id, parents:[...], refs:[ブックマーク名...], isWorking, isStash, message, timestamp, author }
+ */
+function Ggit_collectNodes(store) {
+  var objects = store.objects || {};
+  var working = store.working || null;
+  var bm = store.bookmarks || {};
+
+  // コミットID → そこを指すブックマーク名一覧
+  var refsByCommit = {};
+  for (var name in bm) {
+    if (!bm.hasOwnProperty(name)) continue;
+    var c = bm[name];
+    (refsByCommit[c] = refsByCommit[c] || []).push(name);
+  }
+
+  var ids = [];
+  for (var id in objects) { if (objects.hasOwnProperty(id)) ids.push(id); }
+
+  var nodes = {};
+  ids.forEach(function (id) {
+    var o = objects[id];
+    var parents = [];
+    if (o.parent && objects.hasOwnProperty(o.parent)) parents.push(o.parent);
+    if (o.parent2 && objects.hasOwnProperty(o.parent2)) parents.push(o.parent2);
+    nodes[id] = {
+      id: id,
+      parents: parents,
+      refs: refsByCommit[id] || [],
+      isWorking: id === working,
+      isStash: !!o.stash,
+      message: o.message,
+      timestamp: o.timestamp,
+      author: o.author
+    };
+  });
+
+  // 子を先に出す位相順（Kahn）。準備済み（未出力の子が無い）ノードを timestamp 降順で選ぶ。
+  var childCount = {};
+  ids.forEach(function (id) { childCount[id] = 0; });
+  ids.forEach(function (id) {
+    nodes[id].parents.forEach(function (p) {
+      if (childCount[p] !== undefined) childCount[p]++;
+    });
+  });
+
+  function newer(a, b) {
+    var ta = nodes[a].timestamp || '', tb = nodes[b].timestamp || '';
+    if (ta !== tb) return ta > tb;   // ISO8601 は辞書順＝時刻順
+    return a > b;                    // タイブレークは id
+  }
+
+  var remaining = {};
+  ids.forEach(function (id) { remaining[id] = true; });
+  var out = [];
+  for (var step = 0; step < ids.length; step++) {
+    var best = null;
+    for (var rid in remaining) {
+      if (!remaining.hasOwnProperty(rid)) continue;
+      if (childCount[rid] !== 0) continue;
+      if (best === null || newer(rid, best)) best = rid;
+    }
+    if (best === null) {            // 循環など想定外。残りをそのまま追加して打ち切る。
+      for (var k in remaining) { if (remaining.hasOwnProperty(k)) out.push(nodes[k]); }
+      return out;
+    }
+    out.push(nodes[best]);
+    delete remaining[best];
+    nodes[best].parents.forEach(function (p) {
+      if (childCount[p] !== undefined) childCount[p]--;
+    });
+  }
+  return out;
+}
+
+/** col より右側で最初の空きレーンを返す。無ければ末尾に追加して返す。 */
+function Ggit_graphEmptyAfter(lanes, col) {
+  for (var i = col + 1; i < lanes.length; i++) {
+    if (lanes[i] === null) return i;
+  }
+  lanes.push(null);
+  return lanes.length - 1;
+}
+
+/**
+ * レーン遷移の接続行（| / \ _）を生成する。
+ *  - lanes: その時点のレーン状態（'|' の判定に使う）。
+ *  - col:   基準カラム。collapse の集約先 / sprout の起点。
+ *  - dups:  col へ collapse する余剰カラム（>col）。'/' で描く（呼び出し側で既に null 化済み）。
+ *  - extras: col から sprout する追加カラム（>col, マージ第2親）。'\\' で描く。縦線は描かない。
+ */
+function Ggit_graphConnector(lanes, col, dups, extras) {
+  var W = lanes.length;
+  for (var d = 0; d < dups.length; d++) if (dups[d] + 1 > W) W = dups[d] + 1;
+  for (var e = 0; e < extras.length; e++) if (extras[e] + 1 > W) W = extras[e] + 1;
+
+  var len = W > 0 ? 2 * W - 1 : 1;
+  var a = [];
+  for (var i = 0; i < len; i++) a[i] = ' ';
+
+  // 継続する縦レーン（sprout で今作った extras カラムには縦線を引かない）
+  for (var c = 0; c < lanes.length; c++) {
+    if (lanes[c] !== null && extras.indexOf(c) < 0) a[2 * c] = '|';
+  }
+
+  // 余剰の子レーンを col へ collapse: '/'（必要なら間を '_' で繋ぐ）
+  for (var k = 0; k < dups.length; k++) {
+    var j = dups[k];
+    a[2 * j - 1] = '/';
+    for (var x = 2 * col + 1; x < 2 * j - 1; x++) { if (a[x] === ' ') a[x] = '_'; }
+  }
+
+  // 追加の親へ sprout: '\\'（必要なら間を '_' で繋ぐ）
+  for (var k2 = 0; k2 < extras.length; k2++) {
+    var ex = extras[k2];
+    a[2 * col + 1] = '\\';
+    for (var x2 = 2 * col + 2; x2 < 2 * ex; x2++) { if (a[x2] === ' ') a[x2] = '_'; }
+  }
+
+  return a.join('');
+}
+
+/**
+ * ノード配列（Ggit_collectNodes の出力＝子が先）から ASCII レーングラフの行を生成する。
+ * 返り値: [{ graph:'<等幅プレフィックス>', id:'<commitId>'|null, node:<node>|null }]
+ *  - id 付きの行が commit 行（クリック対象）。id=null は接続行。
+ *  - graph 文字列は 2*col 位置に各レーンの記号（'*' commit / '|' 縦 / 接続記号）を置く。
+ */
+function Ggit_graphLines(nodes) {
+  var lanes = [];      // 各カラムが「次に描く commitId」（無ければ null）
+  var rows = [];
+
+  function firstLaneOf(id) {
+    for (var i = 0; i < lanes.length; i++) if (lanes[i] === id) return i;
+    return -1;
+  }
+  function firstEmpty() {
+    for (var i = 0; i < lanes.length; i++) if (lanes[i] === null) return i;
+    return -1;
+  }
+
+  for (var n = 0; n < nodes.length; n++) {
+    var node = nodes[n];
+    var id = node.id;
+    var parents = node.parents || [];
+
+    // この commit のカラム
+    var col = firstLaneOf(id);
+    if (col === -1) {
+      col = firstEmpty();
+      if (col === -1) { col = lanes.length; lanes.push(null); }
+      lanes[col] = id;
+    }
+
+    // 複数の子が同じ親（この commit）へ合流＝余剰レーンを col へ collapse。
+    // collapse は commit 行の「上」に描く（合流先コミットの直前で枝が閉じる）。
+    var dups = [];
+    for (var j = 0; j < lanes.length; j++) {
+      if (j !== col && lanes[j] === id) dups.push(j);
+    }
+    if (dups.length) {
+      for (var dd = 0; dd < dups.length; dd++) lanes[dups[dd]] = null; // 先に null 化
+      rows.push({ graph: Ggit_graphConnector(lanes, col, dups, []), id: null, node: null });
+    }
+
+    // commit 行（col に '*'、他の非null レーンに '|'）
+    var cells = [];
+    for (var i = 0; i < lanes.length; i++) {
+      cells.push(lanes[i] === null ? ' ' : (i === col ? '*' : '|'));
+    }
+    rows.push({ graph: cells.join(' '), id: id, node: node });
+
+    // 前進: col→第1親、追加の親（マージ）→col の右の空きレーンへ sprout（commit 行の「下」）。
+    var p0 = parents.length > 0 ? parents[0] : null;
+    lanes[col] = p0;
+    var extras = [];
+    for (var pi = 1; pi < parents.length; pi++) {
+      var ec = Ggit_graphEmptyAfter(lanes, col);
+      lanes[ec] = parents[pi];
+      extras.push(ec);
+    }
+    if (extras.length) {
+      rows.push({ graph: Ggit_graphConnector(lanes, col, [], extras), id: null, node: null });
+    }
+
+    // 末尾の空きレーンを刈る
+    while (lanes.length && lanes[lanes.length - 1] === null) lanes.pop();
+  }
+
+  return rows;
+}
+
+// ----- File: src/Hash.js -----
+/**
+ * Hash.js — コミットID（SHA-256 短縮ハッシュ）。
+ *
+ * 設計仕様書 §5.1: 本文シリアライズの SHA-256 を短縮してコミットIDとする。
+ */
+
+/** 文字列の SHA-256 を小文字 hex で返す。 */
+function Ggit_sha256Hex(input) {
+  var bytes = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256, input, Utilities.Charset.UTF_8);
+  var hex = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var b = (bytes[i] + 256) % 256; // byte は符号付きのため 0..255 に正規化
+    var h = b.toString(16);
+    hex += (h.length === 1 ? '0' : '') + h;
+  }
+  return hex;
+}
+
+/**
+ * コミットIDを算出する。既存IDと衝突する短縮形は桁を伸ばして一意化する。
+ * 入力は parent / timestamp / 本文全文を連結したもの。
+ * （jjモデルではコミットにブランチ所有概念が無いため、ハッシュ入力から branch を外した。）
+ */
+function Ggit_commitId(store, parent, timestamp, fullText) {
+  var hex = Ggit_sha256Hex((parent || '') + '\n' + timestamp + '\n' + fullText);
+  for (var len = 7; len < hex.length; len++) {
+    var cand = hex.substring(0, len);
+    if (!store.objects[cand]) return cand;
+  }
+  return hex;
+}
+
+// ----- File: src/Menu.js -----
+/**
+ * Menu.js — onOpen カスタムメニューと UI ハンドラ。
+ *
+ * Jujutsu 流モデル: commit は現在地 working（@）を前進させ、ブックマークは手動で設定/移動する。
+ * Log はブランチ（分岐）を意識した ASCII レーングラフで表示し、フラット表示にも切替できる。
+ * スタッシュは objects 内の仮コミット（stash:true）として一覧し、pop（戻して消す）/ drop できる。
+ * 選択が必要な操作（diff / merge / goto / bookmark）は HtmlService の小ダイアログで行う。
+ */
+
+/** ドキュメントを開いたときにカスタムメニューを生成する（単純トリガ）。 */
+function onOpen() {
+  DocumentApp.getUi()
+    .createMenu('ggit')
+    .addItem('Commit…', 'ggitUI_commit')
+    .addItem('Log（グラフ）', 'ggitUI_log')
+    .addItem('Diff…', 'ggitUI_diff')
+    .addSeparator()
+    .addItem('Bookmark…', 'ggitUI_bookmark')
+    .addItem('Goto…', 'ggitUI_goto')
+    .addItem('ステータス', 'ggitUI_status')
+    .addSeparator()
+    .addItem('Merge…', 'ggitUI_merge')
+    .addSeparator()
+    .addItem('About', 'ggitUI_about')
+    .addToUi();
+}
+
+/* ===================== 共通ユーティリティ ===================== */
+
+function Ggit_esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function Ggit_showModal(htmlStr, title, w, h) {
+  var out = HtmlService.createHtmlOutput(htmlStr).setWidth(w).setHeight(h);
+  DocumentApp.getUi().showModalDialog(out, title);
+}
+
+/* ===================== UI から呼ばれるサーバ補助 ===================== */
+
+/** 1ノードを UI 向けに簡約する。 */
+function Ggit_uiNode(node) {
+  return {
+    id: node.id, message: node.message, timestamp: node.timestamp, author: node.author,
+    refs: node.refs || [], isWorking: !!node.isWorking, isStash: !!node.isStash
+  };
+}
+
+/** Log モーダル用データ: グラフ行・フラット列・現在地・ブックマーク・スタッシュ。 */
+function Ggit_uiGraphData() {
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
+  var nodes = Ggit_collectNodes(store);
+
+  var rows = Ggit_graphLines(nodes).map(function (r) {
+    return { graph: r.graph, id: r.id, c: r.node ? Ggit_uiNode(r.node) : null };
+  });
+  var flat = nodes.map(Ggit_uiNode);
+  var bookmarks = [];
+  for (var name in store.bookmarks) {
+    if (store.bookmarks.hasOwnProperty(name)) bookmarks.push({ name: name, commitId: store.bookmarks[name] });
+  }
+  return {
+    rows: rows, flat: flat, working: store.working || null,
+    bookmarks: bookmarks, stashes: Ggit_listStashes(store)
+  };
+}
+
+/** 全コミット（スタッシュ除く）を新しい順に返す（diff セレクタ用）。 */
+function Ggit_uiListCommits() {
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
+  return Ggit_collectNodes(store)
+    .filter(function (n) { return !n.isStash; })
+    .map(Ggit_uiNode);
+}
+
+/** goto / merge / bookmark のセレクタ用: ブックマーク＋コミット＋現在地。 */
+function Ggit_uiListRefs() {
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
+  var bookmarks = [];
+  for (var name in store.bookmarks) {
+    if (store.bookmarks.hasOwnProperty(name)) bookmarks.push({ name: name, commitId: store.bookmarks[name] });
+  }
+  var commits = Ggit_collectNodes(store)
+    .filter(function (n) { return !n.isStash; })
+    .map(Ggit_uiNode);
+  return { bookmarks: bookmarks, commits: commits, working: store.working || null };
+}
+
+/* ===================== メニューハンドラ ===================== */
+
+function ggitUI_commit() {
+  var ui = DocumentApp.getUi();
+  var res = ui.prompt('ggit commit', 'コミットメッセージを入力してください:', ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  var msg = (res.getResponseText() || '').trim();
+  if (!msg) { ui.alert('ggit commit', 'メッセージが空です。中止しました。', ui.ButtonSet.OK); return; }
+  try {
+    var id = Ggit_commit(msg);
+    ui.alert('ggit commit', 'コミットしました: ' + id + '\n（現在地 @ をこのコミットへ進めました。ブックマークは動きません。）', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit commit', e.message, ui.ButtonSet.OK);
+  }
+}
+
+function ggitUI_log() {
+  // データ取得・移動・スタッシュ操作はすべてクライアントから google.script.run で呼ぶ。
+  // コミット行クリックでその時点へ現在地 @ を移動（未コミット内容はスタッシュへ退避）。
+  var html =
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
+    '<div style="margin-bottom:4px">' +
+    '<button id="bGraph" onclick="setView(\'graph\')">グラフ</button> ' +
+    '<button id="bFlat" onclick="setView(\'flat\')">フラット</button>' +
+    '<span id="working" style="margin-left:10px;color:#188038"></span></div>' +
+    '<div id="status" style="min-height:18px;color:#188038;margin-bottom:6px"></div>' +
+    '<div style="color:#888;margin-bottom:4px">' +
+    '行をクリックすると現在地 @ をそのコミットへ移動します（現在の未コミット内容はスタッシュに退避）。' +
+    '<code>&lt;name&gt;</code>=ブックマーク, <code>@</code>=現在地, <code>[stash]</code>=スタッシュ。</div>' +
+    '<div id="list">読み込み中…</div>' +
+    '<div id="stashes"></div>' +
+    '<script>' +
+    'var DATA=null,VIEW="graph";' +
+    'function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}' +
+    'function setStatus(m,err){var d=document.getElementById("status");d.style.color=err?"#d93025":"#188038";d.innerText=m||"";}' +
+    'function onErr(e){setStatus(e.message||String(e),true);}' +
+    'function refs(c){var h="";if(c.refs&&c.refs.length){h+=" "+c.refs.map(function(n){return "<span style=\\"background:#e8f0fe;color:#1a73e8;border-radius:3px;padding:0 4px\\">"+esc(n)+"</span>";}).join(" ");}' +
+    'if(c.isWorking){h+=" <span style=\\"color:#188038;font-weight:bold\\">@</span>";}' +
+    'if(c.isStash){h+=" <span style=\\"color:#b06000\\">[stash]</span>";}return h;}' +
+    'function commitCell(c){return "<span style=\\"font-family:monospace;color:#1a73e8\\">"+esc(c.id)+"</span>"+refs(c)+"  "+esc(c.message)+" <span style=\\"color:#aaa\\">"+esc(c.timestamp)+"</span>";}' +
+    'function rowClick(id){return "onclick=\\"goTo(\'"+esc(id)+"\')\\" onmouseover=\\"this.style.background=\'#f1f3f4\'\\" onmouseout=\\"this.style.background=\'\'\\" style=\\"cursor:pointer\\"";}' +
+    'function renderGraph(){var rows=DATA.rows;if(!rows.length)return "<div style=\\"color:#888\\">コミットがありません。</div>";' +
+    'var h="<table style=\\"border-collapse:collapse;width:100%\\">";' +
+    'for(var i=0;i<rows.length;i++){var r=rows[i];' +
+    'var g="<td style=\\"font-family:monospace;white-space:pre;color:#444\\">"+esc(r.graph)+"</td>";' +
+    'if(r.c){h+="<tr "+rowClick(r.c.id)+">"+g+"<td>"+commitCell(r.c)+"</td></tr>";}' +
+    'else{h+="<tr>"+g+"<td></td></tr>";}}' +
+    'return h+"</table>";}' +
+    'function renderFlat(){var f=DATA.flat;if(!f.length)return "<div style=\\"color:#888\\">コミットがありません。</div>";' +
+    'var h="<table style=\\"border-collapse:collapse;width:100%\\">";' +
+    'for(var i=0;i<f.length;i++){var c=f[i];h+="<tr "+rowClick(c.id)+"><td>"+commitCell(c)+"</td></tr>";}' +
+    'return h+"</table>";}' +
+    'function render(){' +
+    'document.getElementById("working").innerText=DATA.working?("現在地 @ "+DATA.working):"(現在地なし)";' +
+    'document.getElementById("bGraph").disabled=(VIEW==="graph");' +
+    'document.getElementById("bFlat").disabled=(VIEW==="flat");' +
+    'document.getElementById("list").innerHTML=(VIEW==="graph")?renderGraph():renderFlat();' +
+    'var s=document.getElementById("stashes");' +
+    'if(!DATA.stashes.length){s.innerHTML="";}' +
+    'else{var sr=DATA.stashes.map(function(o){' +
+    'return "<tr><td style=\\"font-family:monospace;white-space:nowrap\\">"+esc(o.id)+"</td>"+' +
+    '"<td>"+esc(o.message)+"</td>"+' +
+    '"<td style=\\"color:#888;white-space:nowrap\\">"+esc(o.timestamp)+"</td>"+' +
+    '"<td style=\\"white-space:nowrap\\"><button onclick=\\"popStash(\'"+esc(o.id)+"\')\\">戻す(pop)</button> "+' +
+    '"<button onclick=\\"dropStash(\'"+esc(o.id)+"\')\\">破棄</button></td></tr>";}).join("");' +
+    's.innerHTML="<div style=\\"margin-top:14px;font-weight:bold\\">スタッシュ（仮コミット）</div>"+' +
+    '"<table style=\\"border-collapse:collapse;width:100%\\"><thead><tr style=\\"text-align:left;border-bottom:1px solid #ddd\\">"+' +
+    '"<th>id</th><th>message</th><th>timestamp</th><th></th></tr></thead><tbody>"+sr+"</tbody></table>";}}' +
+    'function setView(v){VIEW=v;if(DATA)render();}' +
+    'function refresh(){google.script.run.withSuccessHandler(function(d){DATA=d;render();}).withFailureHandler(onErr).Ggit_uiGraphData();}' +
+    'function goTo(id){if(!confirm("現在地 @ を "+id+" へ移動します。\\n現在の未コミット内容はスタッシュに退避されます。よろしいですか？"))return;' +
+    'setStatus("移動中…");google.script.run.withSuccessHandler(function(r){setStatus("移動しました: "+r.commitId+(r.stashed?"（未コミット内容をスタッシュに退避）":""));refresh();}).withFailureHandler(onErr).Ggit_goto(id);}' +
+    'function popStash(id){if(!confirm("スタッシュ "+id+" の内容を現在のタブに戻し、このスタッシュを消します。よろしいですか？"))return;' +
+    'setStatus("適用中…");google.script.run.withSuccessHandler(function(r){setStatus("スタッシュを戻して消しました"+(r.stashed?"（直前の内容を退避）":""));refresh();}).withFailureHandler(onErr).Ggit_popStash(id);}' +
+    'function dropStash(id){if(!confirm("スタッシュ "+id+" を破棄します。元に戻せません。よろしいですか？"))return;' +
+    'google.script.run.withSuccessHandler(function(){setStatus("スタッシュを破棄しました");refresh();}).withFailureHandler(onErr).Ggit_dropStash(id);}' +
+    'refresh();' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit log', 720, 560);
+}
+
+function ggitUI_diff() {
+  var ui = DocumentApp.getUi();
+  var commits = Ggit_uiListCommits();
+  if (commits.length < 2) {
+    ui.alert('ggit diff', '差分表示には2つ以上のコミットが必要です。', ui.ButtonSet.OK);
+    return;
+  }
+  // A は既定で最古、B は既定で最新。
+  var last = commits.length - 1;
+  var optsA = commits.map(function (c, i) {
+    return '<option value="' + Ggit_esc(c.id) + '"' + (i === last ? ' selected' : '') + '>' +
+      Ggit_esc(c.id + ' — ' + c.message) + '</option>';
+  }).join('');
+  var optsB = commits.map(function (c, i) {
+    return '<option value="' + Ggit_esc(c.id) + '"' + (i === 0 ? ' selected' : '') + '>' +
+      Ggit_esc(c.id + ' — ' + c.message) + '</option>';
+  }).join('');
+
+  var html =
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
+    '<div style="margin-bottom:8px">' +
+    'A: <select id="a">' + optsA + '</select> ' +
+    'B: <select id="b">' + optsB + '</select> ' +
+    '<button onclick="run()">差分表示</button></div>' +
+    '<div id="out" style="border:1px solid #ddd;padding:8px;min-height:300px;' +
+    'white-space:pre-wrap;font-family:monospace;overflow:auto">…</div>' +
+    '<script>' +
+    'function run(){' +
+    'var a=document.getElementById("a").value,b=document.getElementById("b").value;' +
+    'document.getElementById("out").innerHTML="計算中…";' +
+    'google.script.run.withSuccessHandler(function(h){document.getElementById("out").innerHTML=h;})' +
+    '.withFailureHandler(function(e){document.getElementById("out").innerText=e.message;})' +
+    '.Ggit_diffCommitsHtml(a,b);}' +
+    'run();' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit diff', 720, 540);
+}
+
+function ggitUI_bookmark() {
+  var ui = DocumentApp.getUi();
+  var refs = Ggit_uiListRefs();
+  if (!refs.commits.length) {
+    ui.alert('ggit bookmark', 'コミットがありません。先にコミットしてください。', ui.ButtonSet.OK);
+    return;
+  }
+  var optsC = refs.commits.map(function (c) {
+    var sel = (c.id === refs.working) ? ' selected' : '';
+    return '<option value="' + Ggit_esc(c.id) + '"' + sel + '>' +
+      Ggit_esc(c.id + ' — ' + c.message) + '</option>';
+  }).join('');
+  var optsExisting = refs.bookmarks.map(function (b) {
+    return '<option value="' + Ggit_esc(b.name) + '">' + Ggit_esc(b.name + ' @ ' + b.commitId) + '</option>';
+  }).join('');
+
+  var html =
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
+    '<p><b>ブックマーク</b>は手動で付ける名前付きポインタです。commit では自動で動きません。</p>' +
+    '<div style="margin-bottom:8px">' +
+    '名前: <input id="name" type="text" placeholder="main など" /> ' +
+    '位置: <select id="commit">' + optsC + '</select> ' +
+    '<button id="set" onclick="doSet()">設定/移動</button></div>' +
+    '<div style="margin-bottom:8px">' +
+    '削除: <select id="del">' + (optsExisting || '<option value="">（なし）</option>') + '</select> ' +
+    '<button id="rm" onclick="doDel()" ' + (optsExisting ? '' : 'disabled') + '>削除</button></div>' +
+    '<div id="out" style="margin-top:8px"></div>' +
+    '<script>' +
+    'function out(m,err){var d=document.getElementById("out");d.style.color=err?"#d93025":"#188038";d.innerText=m;}' +
+    'function doSet(){var n=document.getElementById("name").value.trim();if(!n){out("名前が空です。",true);return;}' +
+    'var c=document.getElementById("commit").value;document.getElementById("set").disabled=true;' +
+    'google.script.run.withSuccessHandler(function(r){out("ブックマーク「"+r.name+"」を "+r.commitId+" に設定しました。");document.getElementById("set").disabled=false;})' +
+    '.withFailureHandler(function(e){out(e.message,true);document.getElementById("set").disabled=false;}).Ggit_bookmarkSet(n,c);}' +
+    'function doDel(){var n=document.getElementById("del").value;if(!n){return;}' +
+    'if(!confirm("ブックマーク「"+n+"」を削除します。よろしいですか？"))return;' +
+    'google.script.run.withSuccessHandler(function(r){out("ブックマーク「"+r.name+"」を削除しました。");})' +
+    '.withFailureHandler(function(e){out(e.message,true);}).Ggit_bookmarkDelete(n);}' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit bookmark', 560, 320);
+}
+
+function ggitUI_goto() {
+  var ui = DocumentApp.getUi();
+  var refs = Ggit_uiListRefs();
+  if (!refs.commits.length) {
+    ui.alert('ggit goto', '移動先のコミットがありません。先にコミットしてください。', ui.ButtonSet.OK);
+    return;
+  }
+  var optsB = refs.bookmarks.map(function (b) {
+    return '<option value="' + Ggit_esc(b.name) + '">' + Ggit_esc('ブックマーク: ' + b.name + ' @ ' + b.commitId) + '</option>';
+  }).join('');
+  var optsC = refs.commits.map(function (c) {
+    return '<option value="' + Ggit_esc(c.id) + '">' + Ggit_esc('コミット: ' + c.id + ' — ' + c.message) + '</option>';
+  }).join('');
+
+  var html =
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
+    '<p>現在地 @ を選択先へ移動し、現在のタブの本文をその内容に置き換えます。' +
+    '未コミットの変更はスタッシュ（仮コミット）へ自動退避します。</p>' +
+    '移動先: <select id="t">' + optsB + optsC + '</select> ' +
+    '<button id="go" onclick="run()">移動</button>' +
+    '<div id="out" style="margin-top:8px"></div>' +
+    '<script>' +
+    'function run(){document.getElementById("go").disabled=true;' +
+    'var t=document.getElementById("t").value;' +
+    'document.getElementById("out").innerText="移動中…";' +
+    'google.script.run.withSuccessHandler(function(r){' +
+    'document.getElementById("out").innerText="現在地 @ を "+r.commitId+" へ移動しました。"+(r.stashed?"（未コミット内容をスタッシュに退避）":"");' +
+    'document.getElementById("go").disabled=false;})' +
+    '.withFailureHandler(function(e){document.getElementById("out").innerText=e.message;document.getElementById("go").disabled=false;})' +
+    '.Ggit_goto(t);}' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit goto', 560, 300);
+}
+
+function ggitUI_status() {
+  var ui = DocumentApp.getUi();
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
+  var working = Ggit_resolveWorking(doc, store);
+  if (!working) {
+    ui.alert('ggit', 'まだコミットがありません。Commit… で最初のコミットを作成してください。', ui.ButtonSet.OK);
+    return;
+  }
+  var bm = [];
+  for (var k in store.bookmarks) {
+    if (store.bookmarks.hasOwnProperty(k)) bm.push(k + ' @ ' + store.bookmarks[k]);
+  }
+  var stashes = Ggit_listStashes(store);
+  ui.alert('ggit',
+    '現在地 @: ' + working + '\n' +
+    'このコミットまでの履歴: ' + Ggit_logChain(store, working).length + '\n' +
+    'ブックマーク: ' + (bm.length ? bm.join(', ') : '（なし）') + '\n' +
+    'スタッシュ: ' + stashes.length + ' 件', ui.ButtonSet.OK);
+}
+
+function ggitUI_merge() {
+  var ui = DocumentApp.getUi();
+  var refs = Ggit_uiListRefs();
+  if (!refs.working) {
+    ui.alert('ggit merge', '現在地がありません。先にコミットしてください。', ui.ButtonSet.OK);
+    return;
+  }
+  var optsB = refs.bookmarks.map(function (b) {
+    return '<option value="' + Ggit_esc(b.name) + '">' + Ggit_esc('ブックマーク: ' + b.name) + '</option>';
+  }).join('');
+  var optsC = refs.commits.filter(function (c) { return c.id !== refs.working; }).map(function (c) {
+    return '<option value="' + Ggit_esc(c.id) + '">' + Ggit_esc('コミット: ' + c.id + ' — ' + c.message) + '</option>';
+  }).join('');
+  if (!optsB && !optsC) {
+    ui.alert('ggit merge', 'マージ可能な対象がありません。', ui.ButtonSet.OK);
+    return;
+  }
+
+  var html =
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
+    '<p>選択したマージ元を、現在地 @ へ 3-way マージします。</p>' +
+    'マージ元: <select id="s">' + optsB + optsC + '</select> ' +
+    '<button id="go" onclick="run()">マージ実行</button>' +
+    '<div id="out" style="margin-top:8px"></div>' +
+    '<script>' +
+    'function run(){document.getElementById("go").disabled=true;' +
+    'document.getElementById("out").innerText="マージ中…";' +
+    'var s=document.getElementById("s").value;' +
+    'google.script.run.withSuccessHandler(function(r){' +
+    'var m;if(r.upToDate){m="既に取り込み済みです（変更なし）。";}' +
+    'else if(r.fastForward){m="早送り（fast-forward）で取り込みました。"+(r.stashed?"（未コミット内容をスタッシュに退避）":"");}' +
+    'else if(r.conflict){m="競合が発生しました。本文に <<<<<<< / ======= / >>>>>>> マーカーを書き戻しました。手動で解決後、commit してください。";}' +
+    'else{m="クリーンにマージしました。マージコミット: "+r.commitId;}' +
+    'document.getElementById("out").innerText=m;document.getElementById("go").disabled=false;})' +
+    '.withFailureHandler(function(e){document.getElementById("out").innerText=e.message;document.getElementById("go").disabled=false;})' +
+    '.Ggit_merge(s);}' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit merge', 560, 260);
+}
+
+function ggitUI_about() {
+  var html =
+    '<div style="font:13px/1.6 Roboto,Arial,sans-serif;padding:8px">' +
+    '<b>ggit</b> — Googleドキュメント単体で動く Git/Jujutsu 風バージョン管理ツール<br>' +
+    '1枚の作業タブの中で commit / log（グラフ）/ diff / bookmark / goto / merge を提供します。<br><br>' +
+    '<b>Jujutsu 流モデル</b>: 現在地 <code>@</code> はコミットID（匿名ヘッド）。commit は <code>@</code> を' +
+    '前進させますが、<b>ブックマークは手動で set/move したときだけ動きます</b>。Log はブランチ（分岐）を' +
+    '意識した ASCII レーングラフで表示し、フラット表示にも切替できます。<br><br>' +
+    'スタッシュは <code>.vcs</code> の中に「<b>スタッシュだと分かる仮コミット（stash:true）</b>」として' +
+    '記録され、戻す（pop）と消えます。<br><br>' +
+    'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。<code>.vcs</code> タブは手動編集しないでください。<br>' +
+    'commit は本文の書式（文字・段落書式）も記録し、goto では書式ごと復元します。' +
+    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +
+    '</div>';
+  Ggit_showModal(html, 'About ggit', 520, 320);
+}
+
+// ----- File: src/Merge.js -----
 /**
  * Merge.js — 3-way マージ（行単位 diff3）と衝突マーカー書き戻し。
  *
@@ -2796,63 +3208,90 @@ function Ggit_findLCA(store, idA, idB) {
 }
 
 /**
- * sourceTabId のブランチを現在のアクティブタブへ 3-way マージする。
- * 結果（マージ後本文）を現タブへ書き戻し、{ conflict, commitId, upToDate } を返す。
- * 競合が無ければ parent2 付きのマージコミットを記録する。競合時はマーカー入り本文を
- * 書き戻し、コミットは作らず手動解決に委ねる。
+ * source（ブックマーク名 または コミットID）を現在地 working（作業タブ）へ 3-way マージする。
+ * 結果（マージ後本文）を作業タブへ書き戻し、
+ * { conflict, commitId, upToDate, fastForward, stashed } を返す。
+ *  - upToDate : マージ元が既に取り込み済み（変更なし）。
+ *  - fastForward : 現在地が マージ元の祖先 → コミットを作らず working を進める。
+ *  - 競合が無い分岐合流 → parent2 付きのマージコミットを記録し working を進める。
+ *  - 競合時 → マーカー入り本文を書き戻し、コミットは作らず手動解決に委ねる。
+ * jj 同様、いずれもブックマークは動かさない（working＝現在地のみ移動）。
  */
-function Ggit_merge(sourceTabId) {
+function Ggit_merge(source) {
   var doc = DocumentApp.getActiveDocument();
-  var curTab = doc.getActiveTab();
-  var curTabId = curTab.getId();
-  if (curTabId === sourceTabId) {
-    throw new Error('同一タブはマージできません。');
+  var tab = doc.getActiveTab();
+  var tabId = tab.getId();
+
+  var meta = Ggit_metaTab(doc);
+  if (meta && tabId === meta.getId()) {
+    throw new Error('.vcs メタタブ上ではマージできません。対象のタブを選択してください。');
   }
 
   var store = Ggit_storeLoad(doc);
-  var curBr = store.branches[curTabId];
-  var srcBr = store.branches[sourceTabId];
-  if (!curBr) throw new Error('現在のタブに履歴がありません。先にコミットしてください。');
-  if (!srcBr) throw new Error('マージ元タブに履歴がありません。');
+  var curHead = Ggit_resolveWorking(doc, store);
+  if (!curHead) throw new Error('現在地に履歴がありません。先にコミットしてください。');
 
-  var curHead = curBr.head, srcHead = srcBr.head;
+  // source をコミットIDへ解決（ブックマーク名優先）。
+  var srcHead = store.bookmarks.hasOwnProperty(source) ? store.bookmarks[source] : source;
+  if (!store.objects.hasOwnProperty(srcHead)) {
+    throw new Error('マージ元が見つかりません: ' + source);
+  }
+  if (srcHead === curHead) throw new Error('現在地自身はマージできません。');
+
   var lca = Ggit_findLCA(store, curHead, srcHead);
 
   // マージ元が既に現在の祖先に含まれる（取り込み済み）。
   if (lca === srcHead) {
-    return { conflict: false, commitId: null, upToDate: true };
+    return { conflict: false, commitId: null, upToDate: true, fastForward: false, stashed: false };
   }
 
-  var baseText = lca ? Ggit_materialize(store, lca) : '';
-  var srcText = Ggit_materialize(store, srcHead);
-  var curText = Ggit_tabText(curTab); // 作業中本文（未コミット編集も取り込む）
+  // 早送り（fast-forward）: 現在地が マージ元の祖先 なら、コミットを作らず working を進める。
+  if (lca === curHead) {
+    var curSnapNow = Ggit_serializeTab(tab);
+    var ffStashed = Ggit_stashIfNeeded(
+      store, tab, curHead, curSnapNow, 'マージ（早送り）前の自動スタッシュ');
+    Ggit_restoreTab(tab, Ggit_materialize(store, srcHead)); // テキスト＋書式ごと取り込む
+    store.working = srcHead;
+    Ggit_storeSave(doc, store);
+    return { conflict: false, commitId: srcHead, upToDate: false, fastForward: true, stashed: ffStashed };
+  }
+
+  // 3-way マージはプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var baseText = lca ? Ggit_plainOf(Ggit_materialize(store, lca)) : '';
+  var srcText = Ggit_plainOf(Ggit_materialize(store, srcHead));
+  var curText = Ggit_tabText(tab); // 作業中本文（未コミット編集も取り込む）
 
   var merged = Ggit_diff3(
     Ggit_splitLines(baseText), Ggit_splitLines(curText), Ggit_splitLines(srcText));
-  Ggit_setTabText(curTab, merged.text);
+  Ggit_setTabText(tab, merged.text);
 
   if (merged.conflict) {
-    return { conflict: true, commitId: null, upToDate: false };
+    return { conflict: true, commitId: null, upToDate: false, fastForward: false, stashed: false };
   }
 
   // クリーンマージ → parent2 付きマージコミットを記録。
+  // 合流結果（プレーン）を書き戻した後のタブをシリアライズし、全コミットを
+  // 同一のスナップショット表現で統一する（移動整合判定・後続 commit の比較が安定）。
   var ts = Ggit_timestamp();
-  var msg = 'Merge ' + (srcBr.name || sourceTabId) + ' into ' + (curBr.name || curTabId);
-  var id = Ggit_commitId(store, curTabId, curHead, ts, merged.text);
+  var srcLabel = store.bookmarks.hasOwnProperty(source) ? source : srcHead;
+  var msg = 'Merge ' + srcLabel + ' into ' + curHead;
+  var snap = Ggit_serializeTab(tab);
+  var id = Ggit_commitId(store, curHead, ts, snap);
   store.objects[id] = {
     id: id,
-    branch: curTabId,
     parent: curHead,
     parent2: srcHead,
     message: msg,
     author: Ggit_author(),
     timestamp: ts,
-    payload: Ggit_makePayload(store, curHead, merged.text)
+    payload: Ggit_makePayload(store, curHead, snap)
   };
-  store.branches[curTabId] = { head: id, name: curTab.getTitle() };
+  store.working = id;
   Ggit_storeSave(doc, store);
-  return { conflict: false, commitId: id, upToDate: false };
+  return { conflict: false, commitId: id, upToDate: false, fastForward: false, stashed: false };
 }
+
+// ----- File: src/SelfTest.js -----
 /**
  * SelfTest.js — Apps Script エディタから手動実行する自己テスト。
  *
@@ -2866,9 +3305,14 @@ function Ggit_merge(sourceTabId) {
 function _test_all() {
   _test_hash();
   _test_snapshotRoundTrip();
+  _test_plainOf();
+  _test_snapshotFormatString();
   _test_mergeNoConflict();
   _test_mergeConflict();
   _test_lca();
+  _test_migrate();
+  _test_graphLines();
+  _test_stashGuard();
   Logger.log('--- self-test 完了 ---');
 }
 
@@ -2879,9 +3323,9 @@ function _ok(name, cond) {
 
 function _test_hash() {
   var store = { objects: {} };
-  var a = Ggit_commitId(store, 't.1', null, '2026-01-01T00:00:00+09:00', 'hello');
-  var b = Ggit_commitId(store, 't.1', null, '2026-01-01T00:00:00+09:00', 'hello');
-  var c = Ggit_commitId(store, 't.1', null, '2026-01-01T00:00:00+09:00', 'world');
+  var a = Ggit_commitId(store, null, '2026-01-01T00:00:00+09:00', 'hello');
+  var b = Ggit_commitId(store, null, '2026-01-01T00:00:00+09:00', 'hello');
+  var c = Ggit_commitId(store, null, '2026-01-01T00:00:00+09:00', 'world');
   _ok('hash 同一入力で同一ID', a === b);
   _ok('hash 異入力で別ID', a !== c);
   _ok('hash 既定7桁', a.length === 7);
@@ -2894,9 +3338,9 @@ function _test_snapshotRoundTrip() {
 
   function commit(parent, text) {
     var ts = '2026-01-01T00:00:00+09:00';
-    var id = Ggit_commitId(store, branch, parent, ts + text, text);
+    var id = Ggit_commitId(store, parent, ts + text, text);
     store.objects[id] = {
-      id: id, branch: branch, parent: parent, parent2: null,
+      id: id, parent: parent, parent2: null,
       message: 'm', author: 'x', timestamp: ts,
       payload: Ggit_makePayload(store, parent, text)
     };
@@ -2927,6 +3371,43 @@ function _test_snapshotRoundTrip() {
   _ok('長い連鎖でも復元一致', Ggit_materialize(store, lastId) === t);
 }
 
+/** Ggit_plainOf の新形式抽出と旧プレーン payload 後方互換（純粋関数）。 */
+function _test_plainOf() {
+  var newSnap = JSON.stringify({ v: 1, text: 'a\nb', fmt: { runs: [], paras: [] } });
+  _ok('plainOf 新形式→text', Ggit_plainOf(newSnap) === 'a\nb');
+  _ok('plainOf 旧プレーン互換', Ggit_plainOf('line1\nline2') === 'line1\nline2');
+  _ok('plainOf 数値風プレーン', Ggit_plainOf('123') === '123');
+  _ok('plainOf JSON風プレーン', Ggit_plainOf('{"a":1}') === '{"a":1}');
+}
+
+/**
+ * payload パイプライン（makePayload/materialize）が書式付きスナップショット文字列でも
+ * round-trip すること、および「テキスト同一・書式のみ差」が別スナップショットになることを確認。
+ */
+function _test_snapshotFormatString() {
+  var store = { version: 1, objects: {}, branches: {} };
+  var branch = 't.fmt';
+  function commit(parent, snap) {
+    var ts = '2026-01-01T00:00:00+09:00';
+    var id = Ggit_commitId(store, parent, ts + snap, snap);
+    store.objects[id] = {
+      id: id, parent: parent, parent2: null,
+      message: 'm', author: 'x', timestamp: ts,
+      payload: Ggit_makePayload(store, parent, snap)
+    };
+    return id;
+  }
+  var snapA = JSON.stringify({ v: 1, text: 'hello\nworld', fmt: { runs: [{ s: 0, e: 4, a: { BOLD: true } }], paras: [{ i: 0, a: {} }] } });
+  var snapB = JSON.stringify({ v: 1, text: 'hello\nworld', fmt: { runs: [{ s: 0, e: 4, a: { ITALIC: true } }], paras: [{ i: 0, a: {} }] } });
+
+  var id1 = commit(null, snapA);
+  var id2 = commit(id1, snapB);
+  _ok('snapshot文字列 round-trip A', Ggit_materialize(store, id1) === snapA);
+  _ok('snapshot文字列 round-trip B', Ggit_materialize(store, id2) === snapB);
+  _ok('書式のみ差で別スナップショット', snapA !== snapB);
+  _ok('plainOf は同一テキスト', Ggit_plainOf(snapA) === Ggit_plainOf(snapB));
+}
+
 function _test_mergeNoConflict() {
   var base = Ggit_splitLines('l1\nl2\nl3\nl4\nl5');
   var ours = Ggit_splitLines('l1\nOURS2\nl3\nl4\nl5');
@@ -2945,6 +3426,84 @@ function _test_mergeConflict() {
   _ok('merge 競合マーカー', m.text.indexOf('<<<<<<<') >= 0 && m.text.indexOf('>>>>>>>') >= 0);
 }
 
+/** 旧スキーマ（v1: tabId→{head,name} / v2: branches+head+stashes）→ v3（bookmarks+working）の移行。 */
+function _test_migrate() {
+  // v1 → v3: branches を name キー化し bookmarks へ。head 概念が無いので working は null。
+  var old = {
+    version: 1, objects: {}, stashes: [],
+    branches: {
+      't.aaa': { head: 'c1', name: 'メイン' },
+      't.bbb': { head: 'c2', name: 'feature' }
+    }
+  };
+  var s = Ggit_migrateStore(old);
+  _ok('migrate version=3', s.version === 3);
+  _ok('migrate bookmarks 名前キー化', s.bookmarks['メイン'] === 'c1' && s.bookmarks['feature'] === 'c2');
+  _ok('migrate working 初期 null', s.working === null);
+  _ok('migrate 旧キー削除', s.branches === undefined && s.head === undefined && s.stashes === undefined);
+
+  // 同名タブは連番で一意化する。
+  var dup = {
+    version: 1, objects: {}, stashes: [],
+    branches: { 't.1': { head: 'h1', name: 'X' }, 't.2': { head: 'h2', name: 'X' } }
+  };
+  var s2 = Ggit_migrateStore(dup);
+  _ok('migrate 同名は一意化', s2.bookmarks['X'] === 'h1' && s2.bookmarks['X-2'] === 'h2');
+
+  // v2 → v3: head→working、stashes[]→stash:true コミット。
+  var v2 = {
+    version: 2, objects: { c9: { id: 'c9', parent: null } },
+    branches: { 'メイン': 'c9' }, head: 'メイン',
+    stashes: [{ id: 'st01', branchName: 'メイン', timestamp: '2026-01-02T00:00:00+09:00', message: '退避', data: 'GZIP' }]
+  };
+  var s3 = Ggit_migrateStore(v2);
+  _ok('migrate v2 bookmarks', s3.bookmarks['メイン'] === 'c9');
+  _ok('migrate v2 head→working', s3.working === 'c9');
+  _ok('migrate stash→コミット化', s3.objects['st01'] && s3.objects['st01'].stash === true &&
+    s3.objects['st01'].parent === 'c9' && s3.objects['st01'].payload.data === 'GZIP');
+
+  // 既に v3 のストアは不変。
+  var nv = { version: 3, objects: {}, bookmarks: { 'メイン': 'c9' }, working: 'c9' };
+  var s4 = Ggit_migrateStore(nv);
+  _ok('migrate v3 は不変', s4.bookmarks['メイン'] === 'c9' && s4.working === 'c9');
+}
+
+/** ASCII レーングラフ（純粋関数）: 分岐・マージの形を検証。 */
+function _test_graphLines() {
+  // A→B→C と B→D の分岐。bookmark main→C、working=D。
+  function gline(store) {
+    return Ggit_graphLines(Ggit_collectNodes(store)).map(function (r) { return r.graph; });
+  }
+  var branch = {
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01' },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02' },
+      C: { id: 'C', parent: 'B', parent2: null, timestamp: '2026-06-03' },
+      D: { id: 'D', parent: 'B', parent2: null, timestamp: '2026-06-04' }
+    },
+    working: 'D', bookmarks: { main: 'C' }
+  };
+  var bl = gline(branch);
+  // 期待形: * (D) / | * (C) / |/ / *(B) / *(A)
+  _ok('graph 分岐: collapse 行 |/ がある', bl.indexOf('|/ ') >= 0 || bl.indexOf('|/') >= 0);
+  _ok('graph 分岐: 2レーン行 "| *" がある', bl.indexOf('| *') >= 0);
+  _ok('graph 分岐: 行数=コミット4＋collapse1', bl.length === 5);
+
+  // マージ: A→B、A→D、E が B と D を合流（parent2）。
+  var merge = {
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01' },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02' },
+      D: { id: 'D', parent: 'A', parent2: null, timestamp: '2026-06-03' },
+      E: { id: 'E', parent: 'B', parent2: 'D', timestamp: '2026-06-04' }
+    },
+    working: 'E', bookmarks: {}
+  };
+  var ml = gline(merge);
+  _ok('graph マージ: sprout 行 |\\ がある', ml.join('\n').indexOf('|\\') >= 0);
+  _ok('graph マージ: collapse 行 |/ がある', ml.join('\n').indexOf('|/') >= 0);
+}
+
 function _test_lca() {
   var store = {
     objects: {
@@ -2957,237 +3516,655 @@ function _test_lca() {
   _ok('LCA(D,C)=A', Ggit_findLCA(store, 'D', 'C') === 'A');
   _ok('LCA(D,B)=B', Ggit_findLCA(store, 'D', 'B') === 'B');
 }
+
 /**
- * Menu.js — onOpen カスタムメニューと UI ハンドラ。
+ * スタッシュの no-op ガード: 内容（テキスト）が履歴上のいずれかのコミット/スタッシュと
+ * 同一なら退避（仮コミット作成）しないことを確認する（書式のみ差も同一扱い）。
+ * 注: Ggit_stashIfNeeded の第2引数 tab は本体で未使用なので null を渡す。
+ *     makePayload/materialize は GAS ランタイム依存のためエディタ実行用。
+ */
+function _test_stashGuard() {
+  var store = { version: 3, objects: {}, bookmarks: {}, working: null };
+  function commit(parent, snap) {
+    var ts = '2026-01-01T00:00:00+09:00';
+    var id = Ggit_commitId(store, parent, ts + snap, snap);
+    store.objects[id] = {
+      id: id, parent: parent, parent2: null,
+      message: 'm', author: 'x', timestamp: ts,
+      payload: Ggit_makePayload(store, parent, snap)
+    };
+    return id;
+  }
+  function snapOf(text) {
+    return JSON.stringify({ v: 1, text: text, fmt: { runs: [], paras: [] } });
+  }
+  var snapA = snapOf('A'), snapB = snapOf('B'), snapC = snapOf('C');
+  var a = commit(null, snapA);
+  var b = commit(a, snapB);
+  store.working = b;
+
+  // 現在地コミット(b)と同一 → 作らない（従来どおり）。
+  _ok('stash 現在地と同一は作らない', Ggit_stashIfNeeded(store, null, b, snapB, 'm') === false);
+  // 現在地以外の既存コミット(a)と同一 → 作らない（今回の拡張点）。
+  _ok('stash 任意コミットと同一は作らない', Ggit_stashIfNeeded(store, null, b, snapA, 'm') === false);
+  // テキスト同一・書式のみ差 → 作らない（テキストベース比較）。
+  var snapBfmt = JSON.stringify({ v: 1, text: 'B', fmt: { runs: [{ s: 0, e: 0, a: { BOLD: true } }], paras: [] } });
+  _ok('stash 書式のみ差は作らない（テキスト基準）', Ggit_stashIfNeeded(store, null, b, snapBfmt, 'm') === false);
+
+  // どのコミットとも異なる新規内容 → 作る。objects が1件増える。
+  var before = 0;
+  for (var k0 in store.objects) { if (store.objects.hasOwnProperty(k0)) before++; }
+  _ok('stash 新規内容は作る', Ggit_stashIfNeeded(store, null, b, snapC, '退避') === true);
+  var after = 0;
+  for (var k1 in store.objects) { if (store.objects.hasOwnProperty(k1)) after++; }
+  _ok('stash 作成で objects 増加', after === before + 1);
+
+  // 直前で作ったスタッシュと同一内容 → 作らない（重複防止が維持）。
+  _ok('stash 同一スタッシュは重複させない', Ggit_stashIfNeeded(store, null, b, snapC, '退避') === false);
+}
+
+// ----- File: src/Snapshot.js -----
+/**
+ * Snapshot.js — payload（full/delta）の生成・復元と gzip+Base64 圧縮。
  *
- * 設計仕様書 §6: commit / log / diff / branch / checkout / merge をメニューから操作する。
- * 選択が必要な操作（diff / merge / checkout）は HtmlService の小ダイアログを用い、
- * google.script.run でサーバ関数を呼び出す。
+ * 設計仕様書 §5.1 / §5.3:
+ *  - payload.type = "full"  … 本文全文を gzip+Base64
+ *  - payload.type = "delta" … 親→当該コミットの diff-match-patch パッチを gzip+Base64
+ *  - 一定間隔でフルスナップショット（基準点）を挿入し、復元時の差分連鎖を短く保つ。
  */
 
-/** ドキュメントを開いたときにカスタムメニューを生成する（単純トリガ）。 */
-function onOpen() {
-  DocumentApp.getUi()
-    .createMenu('ggit')
-    .addItem('Commit…', 'ggitUI_commit')
-    .addItem('Log', 'ggitUI_log')
-    .addItem('Diff…', 'ggitUI_diff')
-    .addSeparator()
-    .addItem('Branch…', 'ggitUI_branch')
-    .addItem('Checkout…', 'ggitUI_checkout')
-    .addSeparator()
-    .addItem('Merge…', 'ggitUI_merge')
-    .addSeparator()
-    .addItem('About', 'ggitUI_about')
-    .addToUi();
+/** delta が連続する上限。これを超える前にフルスナップショットを挿入する。 */
+var GGIT_FULL_INTERVAL = 20;
+
+/** テキストを gzip+Base64 で圧縮。 */
+function Ggit_gzipB64(text) {
+  var gz = Utilities.gzip(Utilities.newBlob(text, 'text/plain'));
+  return Utilities.base64Encode(gz.getBytes());
 }
 
-/* ===================== 共通ユーティリティ ===================== */
-
-function Ggit_esc(s) {
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+/** gzip+Base64 を復号してテキストへ戻す。 */
+function Ggit_gunzipB64(b64) {
+  var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'application/x-gzip');
+  return Utilities.ungzip(blob).getDataAsString('UTF-8');
 }
 
-function Ggit_showModal(htmlStr, title, w, h) {
-  var out = HtmlService.createHtmlOutput(htmlStr).setWidth(w).setHeight(h);
-  DocumentApp.getUi().showModalDialog(out, title);
+/** parentId から遡り、直近のフルスナップショットまでの delta 連続数を返す。 */
+function Ggit_deltasSinceFull(store, parentId) {
+  var n = 0, id = parentId;
+  while (id) {
+    var o = store.objects[id];
+    if (!o) break;
+    if (o.payload.type === 'full') break;
+    n++;
+    id = o.parent;
+  }
+  return n;
 }
 
-/* ===================== UI から呼ばれるサーバ補助 ===================== */
-
-/** アクティブタブのコミット列（新しい順）。 */
-function Ggit_uiListCommits() {
-  var doc = DocumentApp.getActiveDocument();
-  var tabId = doc.getActiveTab().getId();
-  var store = Ggit_storeLoad(doc);
-  return Ggit_logChain(store, tabId).map(function (o) {
-    return { id: o.id, message: o.message, timestamp: o.timestamp, author: o.author };
-  });
+/**
+ * 親と本文から payload を生成する。
+ * 親が無い、または delta 連鎖が上限間際なら full、それ以外は delta。
+ */
+function Ggit_makePayload(store, parentId, fullText) {
+  if (!parentId) {
+    return { type: 'full', data: Ggit_gzipB64(fullText) };
+  }
+  if (Ggit_deltasSinceFull(store, parentId) >= GGIT_FULL_INTERVAL - 1) {
+    return { type: 'full', data: Ggit_gzipB64(fullText) };
+  }
+  var parentText = Ggit_materialize(store, parentId);
+  var dmp = new diff_match_patch();
+  var patches = dmp.patch_make(parentText, fullText);
+  return { type: 'delta', data: Ggit_gzipB64(dmp.patch_toText(patches)) };
 }
 
-/** `.vcs` を除く全タブ。excludeActiveTabId を渡すとそのタブも除外。 */
-function Ggit_uiListBranches(excludeActiveTabId) {
-  var doc = DocumentApp.getActiveDocument();
-  var meta = Ggit_metaTab(doc);
-  var metaId = meta ? meta.getId() : null;
-  var store = Ggit_storeLoad(doc);
+/**
+ * 指定コミットの本文全文を復元する。
+ * コミットから親方向へ直近の full まで遡り、full 本文に delta を順方向適用する。
+ */
+function Ggit_materialize(store, id) {
+  var chain = [];
+  var cur = id;
+  while (cur) {
+    var o = store.objects[cur];
+    if (!o) throw new Error('オブジェクトが見つかりません: ' + cur);
+    chain.push(o);
+    if (o.payload.type === 'full') break;
+    cur = o.parent;
+  }
+  chain.reverse(); // [full(基準点), delta, delta, ... , target]
+
+  var text = Ggit_gunzipB64(chain[0].payload.data);
+  var dmp = new diff_match_patch();
+  for (var i = 1; i < chain.length; i++) {
+    var patches = dmp.patch_fromText(Ggit_gunzipB64(chain[i].payload.data));
+    text = dmp.patch_apply(patches, text)[0];
+  }
+  return text;
+}
+
+/* ===================== 書式付きスナップショット（スコープ①: 記録＋復元） ===================== */
+/*
+ * payload に格納する「素材」を、プレーンテキストから構造化 JSON 文字列に拡張する。
+ *   { "v":1, "text": <body.getText() と一致する全文>,
+ *     "fmt": { "runs":[{s,e,a}], "paras":[{i,a}] } }
+ * - text を diff/merge がそのまま射影（Ggit_plainOf）して使うため、プレーン処理は無改変。
+ * - fmt を含めて比較することで「テキスト同一・書式のみ変更」を commit が検知できる。
+ * - 圧縮/delta/コミットID は文字列処理なので、この JSON 文字列をそのまま流せる（無改修）。
+ *
+ * 後方互換: 旧 `.vcs`（payload が生プレーンテキスト）も Ggit_parseSnap / Ggit_plainOf が
+ * 透過的に読めるため、既存ドキュメントを壊さない。
+ *
+ * フィデリティ境界（①）: 文字書式・段落書式のみ対応。表/画像/リストのグリフ・ネストは
+ * 非対応（テキストとしては保持されるが書式は復元しない）。設計仕様書 §7.3 に整合。
+ */
+
+/** スナップショット文字列を { v, text, fmt } へ復号。旧プレーン payload は {text:raw} 扱い。 */
+function Ggit_parseSnap(s) {
+  if (s == null) return { v: 0, text: '', fmt: null };
+  var o = null;
+  try { o = JSON.parse(s); } catch (e) { o = null; }
+  if (o && typeof o === 'object' && o.v && typeof o.text === 'string') return o;
+  // 旧形式（生プレーンテキスト）または非該当 JSON はそのままテキストとして扱う。
+  return { v: 0, text: String(s), fmt: null };
+}
+
+/** スナップショット文字列からプレーン全文を取り出す（diff/merge 用・後方互換）。 */
+function Ggit_plainOf(s) {
+  return Ggit_parseSnap(s).text;
+}
+
+/** オブジェクトに列挙可能キーが1つでもあるか。 */
+function Ggit_hasKeys(o) {
+  for (var k in o) { if (o.hasOwnProperty(k)) return true; }
+  return false;
+}
+
+/** 文字列値の属性名→列挙型のマップ（①で復元対象とする段落系 enum のみ）。 */
+function Ggit_enumFromString(attrKey, name) {
+  var maps = {
+    HEADING: DocumentApp.ParagraphHeading,
+    HORIZONTAL_ALIGNMENT: DocumentApp.HorizontalAlignment
+  };
+  var e = maps[attrKey];
+  if (!e) return null;
+  var v = e[name];
+  return v === undefined ? null : v;
+}
+
+/**
+ * getAttributes() の戻り値を JSON 安全な形へ正規化する。
+ * - null/undefined は捨てる（未設定属性でストアを肥大させない）。
+ * - 文字列/数値/真偽はそのまま。
+ * - それ以外（列挙型など）は { __enum: <toString> } で名前を保持する。
+ */
+function Ggit_normAttrs(attrs) {
+  var out = {};
+  for (var k in attrs) {
+    if (!attrs.hasOwnProperty(k)) continue;
+    var v = attrs[k];
+    if (v === null || v === undefined) continue;
+    var tv = typeof v;
+    if (tv === 'string' || tv === 'number' || tv === 'boolean') {
+      out[k] = v;
+    } else {
+      out[k] = { __enum: String(v) };
+    }
+  }
+  return out;
+}
+
+/** 正規化属性を setAttributes() 適用可能な形へ戻す。復元不能な enum は捨てる（①の境界）。 */
+function Ggit_denormAttrs(obj) {
+  var out = {};
+  for (var k in obj) {
+    if (!obj.hasOwnProperty(k)) continue;
+    var v = obj[k];
+    if (v && typeof v === 'object' && v.__enum !== undefined) {
+      var e = Ggit_enumFromString(k, v.__enum);
+      if (e !== null) out[k] = e; // 未対応 enum は適用しない
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** body の段落系要素（Paragraph / ListItem）を本文順で返す。 */
+function Ggit_paraElements(body) {
   var out = [];
-  Ggit_allTabs(doc).forEach(function (t) {
-    var id = t.getId();
-    if (id === metaId) return;
-    if (excludeActiveTabId && id === excludeActiveTabId) return;
-    var br = store.branches[id];
-    out.push({ tabId: id, title: t.getTitle(), head: br ? br.head : null, tracked: !!br });
+  var n = body.getNumChildren();
+  for (var i = 0; i < n; i++) {
+    var c = body.getChild(i);
+    var t = c.getType();
+    if (t === DocumentApp.ElementType.PARAGRAPH || t === DocumentApp.ElementType.LIST_ITEM) {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+/**
+ * タブ本文を書式付きスナップショット文字列としてシリアライズする。
+ * 文字書式は body.editAsText() の属性区間、段落書式は段落系要素の属性として取得する。
+ */
+function Ggit_serializeTab(tab) {
+  var body = tab.asDocumentTab().getBody();
+  var text = body.getText();
+
+  var runs = [];
+  if (text.length > 0) {
+    var et = body.editAsText();
+    var idx = et.getTextAttributeIndices();
+    for (var i = 0; i < idx.length; i++) {
+      var s = idx[i];
+      var e = (i + 1 < idx.length) ? idx[i + 1] - 1 : text.length - 1; // 終端は inclusive
+      if (e < s) continue;
+      runs.push({ s: s, e: e, a: Ggit_normAttrs(et.getAttributes(s)) });
+    }
+  }
+
+  var paras = [];
+  var pels = Ggit_paraElements(body);
+  for (var j = 0; j < pels.length; j++) {
+    paras.push({ i: j, a: Ggit_normAttrs(pels[j].getAttributes()) });
+  }
+
+  return JSON.stringify({ v: 1, text: text, fmt: { runs: runs, paras: paras } });
+}
+
+/**
+ * スナップショット文字列をタブ本文へ復元する（テキスト＋書式）。
+ * setText 後に段落属性→文字属性の順で再適用する（段落の NamedStyle が文字属性を
+ * 上書きしうるため、文字属性を後に当てて明示書式を優先する）。
+ */
+function Ggit_restoreTab(tab, snapStr) {
+  var body = tab.asDocumentTab().getBody();
+  var snap = Ggit_parseSnap(snapStr);
+  var text = snap.text;
+  body.setText(text);
+  if (!snap.fmt) return; // 旧プレーン payload はテキストのみ復元。
+
+  var pels = Ggit_paraElements(body);
+  var paras = snap.fmt.paras || [];
+  for (var j = 0; j < paras.length; j++) {
+    var p = paras[j];
+    if (p.i < pels.length) {
+      var pa = Ggit_denormAttrs(p.a);
+      if (Ggit_hasKeys(pa)) pels[p.i].setAttributes(pa);
+    }
+  }
+
+  if (text.length > 0) {
+    var et = body.editAsText();
+    var runs = snap.fmt.runs || [];
+    for (var k = 0; k < runs.length; k++) {
+      var r = runs[k];
+      var ra = Ggit_denormAttrs(r.a);
+      if (Ggit_hasKeys(ra) && r.e >= r.s) et.setAttributes(r.s, r.e, ra);
+    }
+  }
+}
+
+// ----- File: src/Stash.js -----
+/**
+ * Stash.js — スタッシュ（＝stash:true 付きの仮コミット）。
+ *
+ * 要望1: スタッシュは DAG の外ではなく、objects 内の「コミットだけどスタッシュだと分かる」
+ * stash:true 付きコミットとして記録する。goto / 復元で上書きされて失われる未コミット内容を、
+ * その時点の現在地 working を親とする仮コミットへ退避する（git stash 相当）。
+ *
+ * 「そこに戻ったらスタッシュを消す」= pop（Ggit_popStash）: スタッシュ内容を作業タブへ戻し、
+ * working をスタッシュの親へ移してから、その仮コミットを objects から削除する。
+ */
+
+/** スタッシュID（親＋timestamp＋本文の SHA-256 短縮）。 */
+function Ggit_stashId(parentId, timestamp, snap) {
+  return Ggit_sha256Hex((parentId || '') + '\n' + timestamp + '\n' + snap).substring(0, 8);
+}
+
+/**
+ * 現在のスナップショット curSnap を必要ならスタッシュ（仮コミット）へ退避する。
+ * 退避した場合 true。内容（テキスト）が履歴上のいずれかのコミット/スタッシュと
+ * 同一なら false（既に保存済みで上書きしても失われないため）。
+ * 同一判定はテキストベース: 書式のみの差は「同じ内容」とみなして退避しない。
+ * parentId は退避元の現在地 working（仮コミットの親・pop で戻る先）。
+ * store は破壊的に更新するが保存は呼び出し側で行う。
+ */
+function Ggit_stashIfNeeded(store, tab, parentId, curSnap, message) {
+  // 内容（テキスト）が履歴上のいずれかのコミット/スタッシュと同一なら、既に保存済みで
+  // 上書きしても失われないため退避不要（現在地コミットも含めて走査する）。
+  // 比較はテキストベース（Ggit_plainOf）: 書式のみ異なる場合は同一とみなす。
+  var curText = Ggit_plainOf(curSnap);
+  for (var k in store.objects) {
+    if (!store.objects.hasOwnProperty(k)) continue;
+    if (Ggit_plainOf(Ggit_materialize(store, k)) === curText) return false;
+  }
+
+  var ts = Ggit_timestamp();
+  var id = Ggit_stashId(parentId, ts, curSnap);
+  while (store.objects.hasOwnProperty(id)) id = id + 'x';
+  store.objects[id] = {
+    id: id,
+    parent: parentId || null,
+    parent2: null,
+    message: message || '自動スタッシュ（復元前）',
+    author: Ggit_author(),
+    timestamp: ts,
+    payload: Ggit_makePayload(store, parentId, curSnap),
+    stash: true
+  };
+  return true;
+}
+
+/** objects 内のスタッシュ（stash:true）を新しい順に一覧する。 */
+function Ggit_listStashes(store) {
+  var out = [];
+  for (var k in store.objects) {
+    if (!store.objects.hasOwnProperty(k)) continue;
+    var o = store.objects[k];
+    if (o.stash) out.push({ id: o.id, message: o.message, timestamp: o.timestamp, parent: o.parent });
+  }
+  out.sort(function (a, b) {
+    var ta = a.timestamp || '', tb = b.timestamp || '';
+    if (ta !== tb) return ta < tb ? 1 : -1;
+    return a.id < b.id ? 1 : -1;
   });
   return out;
 }
 
-/* ===================== メニューハンドラ ===================== */
-
-function ggitUI_commit() {
-  var ui = DocumentApp.getUi();
-  var res = ui.prompt('ggit commit', 'コミットメッセージを入力してください:', ui.ButtonSet.OK_CANCEL);
-  if (res.getSelectedButton() !== ui.Button.OK) return;
-  var msg = (res.getResponseText() || '').trim();
-  if (!msg) { ui.alert('ggit commit', 'メッセージが空です。中止しました。', ui.ButtonSet.OK); return; }
-  try {
-    var id = Ggit_commit(msg);
-    ui.alert('ggit commit', 'コミットしました: ' + id, ui.ButtonSet.OK);
-  } catch (e) {
-    ui.alert('ggit commit', e.message, ui.ButtonSet.OK);
-  }
-}
-
-function ggitUI_log() {
-  var commits = Ggit_uiListCommits();
-  var rows;
-  if (!commits.length) {
-    rows = '<tr><td colspan="3" style="color:#888">コミットがありません。</td></tr>';
-  } else {
-    rows = commits.map(function (c) {
-      return '<tr>' +
-        '<td style="font-family:monospace;color:#1a73e8;white-space:nowrap">' + Ggit_esc(c.id) + '</td>' +
-        '<td>' + Ggit_esc(c.message) + '</td>' +
-        '<td style="color:#888;white-space:nowrap">' + Ggit_esc(c.timestamp) + '</td>' +
-        '</tr>';
-    }).join('');
-  }
-  var html =
-    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
-    '<table style="border-collapse:collapse;width:100%">' +
-    '<thead><tr style="text-align:left;border-bottom:1px solid #ddd">' +
-    '<th>id</th><th>message</th><th>timestamp</th></tr></thead>' +
-    '<tbody>' + rows + '</tbody></table></div>';
-  Ggit_showModal(html, 'ggit log', 640, 480);
-}
-
-function ggitUI_diff() {
-  var ui = DocumentApp.getUi();
-  var commits = Ggit_uiListCommits();
-  if (commits.length < 2) {
-    ui.alert('ggit diff', '差分表示には2つ以上のコミットが必要です。', ui.ButtonSet.OK);
-    return;
-  }
-  // A は既定で最古、B は既定で最新。
-  var last = commits.length - 1;
-  var optsA = commits.map(function (c, i) {
-    return '<option value="' + Ggit_esc(c.id) + '"' + (i === last ? ' selected' : '') + '>' +
-      Ggit_esc(c.id + ' — ' + c.message) + '</option>';
-  }).join('');
-  var optsB = commits.map(function (c, i) {
-    return '<option value="' + Ggit_esc(c.id) + '"' + (i === 0 ? ' selected' : '') + '>' +
-      Ggit_esc(c.id + ' — ' + c.message) + '</option>';
-  }).join('');
-
-  var html =
-    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
-    '<div style="margin-bottom:8px">' +
-    'A: <select id="a">' + optsA + '</select> ' +
-    'B: <select id="b">' + optsB + '</select> ' +
-    '<button onclick="run()">差分表示</button></div>' +
-    '<div id="out" style="border:1px solid #ddd;padding:8px;min-height:300px;' +
-    'white-space:pre-wrap;font-family:monospace;overflow:auto">…</div>' +
-    '<script>' +
-    'function run(){' +
-    'var a=document.getElementById("a").value,b=document.getElementById("b").value;' +
-    'document.getElementById("out").innerHTML="計算中…";' +
-    'google.script.run.withSuccessHandler(function(h){document.getElementById("out").innerHTML=h;})' +
-    '.withFailureHandler(function(e){document.getElementById("out").innerText=e.message;})' +
-    '.Ggit_diffCommitsHtml(a,b);}' +
-    'run();' +
-    '</script></div>';
-  Ggit_showModal(html, 'ggit diff', 720, 540);
-}
-
-function ggitUI_branch() {
-  var ui = DocumentApp.getUi();
-  var res = ui.prompt('ggit branch', '新しいブランチ（タブ）名を入力してください:', ui.ButtonSet.OK_CANCEL);
-  if (res.getSelectedButton() !== ui.Button.OK) return;
-  var name = (res.getResponseText() || '').trim();
-  if (!name) { ui.alert('ggit branch', '名前が空です。中止しました。', ui.ButtonSet.OK); return; }
-  try {
-    var id = Ggit_branch(name);
-    ui.alert('ggit branch',
-      'ブランチ「' + name + '」を作成しました（タブID: ' + id + '）。\n' +
-      '左側のタブ一覧から新しいタブをクリックして切り替えてください。', ui.ButtonSet.OK);
-  } catch (e) {
-    ui.alert('ggit branch', e.message, ui.ButtonSet.OK);
-  }
-}
-
-function ggitUI_checkout() {
-  var ui = DocumentApp.getUi();
+/**
+ * スタッシュを作業タブへ戻して消す（git stash pop 相当・要望「戻ったら消す」）。
+ * 戻す前の未コミット内容は再び退避する。
+ * 戻り値: { stashId, stashed, popped }。
+ */
+function Ggit_popStash(stashId) {
   var doc = DocumentApp.getActiveDocument();
-  var branches = Ggit_uiListBranches(doc.getActiveTab().getId());
-  if (!branches.length) {
-    ui.alert('ggit checkout', '切り替え先の他タブがありません。', ui.ButtonSet.OK);
-    return;
+  var tab = doc.getActiveTab();
+
+  var meta = Ggit_metaTab(doc);
+  if (meta && tab.getId() === meta.getId()) {
+    throw new Error('.vcs メタタブには適用できません。対象のタブを選択してください。');
   }
-  var opts = branches.map(function (b) {
-    return '<option value="' + Ggit_esc(b.tabId) + '">' +
-      Ggit_esc(b.title + (b.head ? ' @ ' + b.head : ' (履歴なし)')) + '</option>';
-  }).join('');
-  var html =
-    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
-    '<p>checkout はプログラムからのタブ切替ができないため（設計仕様書 §9）、' +
-    '対象タブの整合性確認のみ行います。確認後、左のタブ一覧から手動で切り替えてください。</p>' +
-    '<select id="t">' + opts + '</select> ' +
-    '<button onclick="run()">整合性を確認</button>' +
-    '<div id="out" style="margin-top:8px"></div>' +
-    '<script>' +
-    'function run(){var t=document.getElementById("t").value;' +
-    'google.script.run.withSuccessHandler(function(r){' +
-    'var s=r.tracked?(r.clean?"整合（HEADと本文が一致）":"未コミットの変更あり（本文がHEADと不一致）"):"履歴なし";' +
-    'document.getElementById("out").innerText="タブ: "+r.title+"\\nHEAD: "+(r.head||"-")+"\\n状態: "+s;})' +
-    '.withFailureHandler(function(e){document.getElementById("out").innerText=e.message;})' +
-    '.Ggit_checkout(t);}' +
-    '</script></div>';
-  Ggit_showModal(html, 'ggit checkout', 520, 280);
+
+  var store = Ggit_storeLoad(doc);
+  var st = store.objects[stashId];
+  if (!st || !st.stash) throw new Error('スタッシュが見つかりません: ' + stashId);
+
+  var snap = Ggit_materialize(store, stashId);
+  var curSnap = Ggit_serializeTab(tab);
+  var cur = Ggit_resolveWorking(doc, store);
+
+  var stashed = false;
+  if (curSnap !== snap) {
+    stashed = Ggit_stashIfNeeded(store, tab, cur, curSnap, 'pop 前の自動スタッシュ');
+    Ggit_restoreTab(tab, snap);
+  }
+  // スタッシュ内容が作業タブへ戻ったので、現在地はスタッシュの親（分岐元）へ。仮コミットは削除。
+  store.working = st.parent || null;
+  delete store.objects[stashId];
+  Ggit_storeSave(doc, store);
+  return { stashId: stashId, stashed: stashed, popped: true };
 }
 
-function ggitUI_merge() {
-  var ui = DocumentApp.getUi();
+/** スタッシュ（仮コミット）を破棄する（git stash drop 相当）。戻り値: { stashId, dropped }。 */
+function Ggit_dropStash(stashId) {
   var doc = DocumentApp.getActiveDocument();
-  var activeId = doc.getActiveTab().getId();
-  var branches = Ggit_uiListBranches(activeId).filter(function (b) { return b.tracked; });
-  if (!branches.length) {
-    ui.alert('ggit merge', 'マージ可能な他ブランチ（履歴のあるタブ）がありません。', ui.ButtonSet.OK);
-    return;
-  }
-  var opts = branches.map(function (b) {
-    return '<option value="' + Ggit_esc(b.tabId) + '">' + Ggit_esc(b.title) + '</option>';
-  }).join('');
-  var html =
-    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
-    '<p>マージ元ブランチを、現在のアクティブタブへ 3-way マージします。</p>' +
-    'マージ元: <select id="s">' + opts + '</select> ' +
-    '<button id="go" onclick="run()">マージ実行</button>' +
-    '<div id="out" style="margin-top:8px"></div>' +
-    '<script>' +
-    'function run(){document.getElementById("go").disabled=true;' +
-    'document.getElementById("out").innerText="マージ中…";' +
-    'var s=document.getElementById("s").value;' +
-    'google.script.run.withSuccessHandler(function(r){' +
-    'var m;if(r.upToDate){m="既に取り込み済みです（変更なし）。";}' +
-    'else if(r.conflict){m="競合が発生しました。本文に <<<<<<< / ======= / >>>>>>> マーカーを書き戻しました。手動で解決後、commit してください。";}' +
-    'else{m="クリーンにマージしました。マージコミット: "+r.commitId;}' +
-    'document.getElementById("out").innerText=m;document.getElementById("go").disabled=false;})' +
-    '.withFailureHandler(function(e){document.getElementById("out").innerText=e.message;document.getElementById("go").disabled=false;})' +
-    '.Ggit_merge(s);}' +
-    '</script></div>';
-  Ggit_showModal(html, 'ggit merge', 560, 260);
+  var store = Ggit_storeLoad(doc);
+  var st = store.objects[stashId];
+  if (!st || !st.stash) throw new Error('スタッシュが見つかりません: ' + stashId);
+  delete store.objects[stashId];
+  Ggit_storeSave(doc, store);
+  return { stashId: stashId, dropped: true };
 }
 
-function ggitUI_about() {
-  var html =
-    '<div style="font:13px/1.6 Roboto,Arial,sans-serif;padding:8px">' +
-    '<b>ggit</b> — Googleドキュメント単体で動くGit風バージョン管理ツール<br>' +
-    'タブをブランチに見立て、commit / log / diff / branch / checkout / merge を提供します。<br><br>' +
-    'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。' +
-    '<code>.vcs</code> タブは手動編集しないでください。<br>' +
-    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3）。' +
-    '</div>';
-  Ggit_showModal(html, 'About ggit', 480, 220);
+// ----- File: src/Store.js -----
+/**
+ * Store.js — オブジェクトストア（コミットグラフ）の永続化。
+ *
+ * 配置は設計仕様書 §5.2 の「案A」を採用し、`.vcs` というタイトルの
+ * ドキュメントタブ本文に JSON 文字列としてストアを格納する。
+ *
+ * ストア構造（version 3: Jujutsu 流ブックマークモデル）:
+ * {
+ *   "version": 3,
+ *   "objects":   { <commitId>: <commitObject>, ... },  // 通常コミット＋スタッシュ（stash:true）
+ *   "bookmarks": { <bookmarkName>: <commitId>, ... },  // 手動の名前付きポインタ（commitで自動前進しない）
+ *   "working":   <commitId>            // 現在地 @（匿名ヘッド）。未確立なら null
+ * }
+ * jj と同様、commit は working（現在地）だけを前進させ、ブックマークは明示操作でのみ動かす。
+ * スタッシュは DAG の外ではなく objects 内の stash:true 付きコミットとして表現する（§Stash.js）。
+ *
+ * 旧スキーマは読み込み時に Ggit_migrateStore で自動移行する:
+ *  - version 1（branches が <tabId>:{head,name}、head 概念なし。「タブ＝ブランチ」）
+ *  - version 2（branches が <branchName>:<headCommitId>、head=現在ブランチ、stashes[] 配列）
+ */
+
+var GGIT_META_TITLE = '.vcs';
+
+/** `.vcs` メタタブを返す（無ければ null）。 */
+function Ggit_metaTab(doc) {
+  var all = Ggit_allTabs(doc);
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].getTitle() === GGIT_META_TITLE) return all[i];
+  }
+  return null;
+}
+
+/** 空のストアを生成。 */
+function Ggit_emptyStore() {
+  return { version: 3, objects: {}, bookmarks: {}, working: null };
+}
+
+/** メタタブからストアを読み込む（無ければ空ストア）。 */
+function Ggit_storeLoad(doc) {
+  doc = doc || DocumentApp.getActiveDocument();
+  var t = Ggit_metaTab(doc);
+  if (!t) return Ggit_emptyStore();
+  var raw = Ggit_tabText(t).trim();
+  if (!raw) return Ggit_emptyStore();
+  var s;
+  try {
+    s = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('.vcs メタタブのJSON解析に失敗しました（手動編集の可能性）: ' + e.message);
+  }
+  s.objects = s.objects || {};
+  return Ggit_migrateStore(s);
+}
+
+/** ストアをメタタブへ書き戻す（メタタブが無ければ生成）。 */
+function Ggit_storeSave(doc, store) {
+  doc = doc || DocumentApp.getActiveDocument();
+  var t = Ggit_metaTab(doc);
+  if (!t) {
+    t = Ggit_createTab(doc, GGIT_META_TITLE);
+  }
+  Ggit_setTabText(t, JSON.stringify(store));
+}
+
+/**
+ * 旧スキーマを最新（version 3: Jujutsu 流ブックマークモデル）へ移行する。純粋関数。
+ *  - version 1（branches が <tabId>:{head,name}）→ まず branches を <branchName>:<headCommitId> へ正規化。
+ *  - version 2（branches/head/stashes[]）→ branches を bookmarks へ、head を working（コミットID）へ、
+ *    stashes[] 各要素を stash:true のコミットへ変換して objects に投入する。
+ * 既に version 3 のストアはそのまま返す（working 欠落時のみ補う）。
+ */
+function Ggit_migrateStore(s) {
+  if (s.version >= 3) {
+    if (s.working === undefined) s.working = null;
+    s.bookmarks = s.bookmarks || {};
+    return s;
+  }
+
+  // --- v1 → v2 相当: branches を <branchName>:<headCommitId> へ正規化 ---
+  var branches = {};
+  for (var k in s.branches) {
+    if (!s.branches.hasOwnProperty(k)) continue;
+    var v = s.branches[k];
+    if (v && typeof v === 'object' && v.head !== undefined) {
+      var name = v.name || k;                       // タブ名（無ければ tabId）を採用
+      var base = name, i = 2;
+      while (branches.hasOwnProperty(name)) { name = base + '-' + i; i++; } // 同名は連番で一意化
+      branches[name] = v.head;
+    } else {
+      branches[k] = v;                              // 既に文字列 HEAD
+    }
+  }
+
+  // --- v2 → v3: branches→bookmarks、head→working、stashes[]→stash コミット ---
+  s.bookmarks = branches;
+  s.working = (s.head && branches.hasOwnProperty(s.head)) ? branches[s.head] : null;
+
+  var stashes = s.stashes || [];
+  for (var j = 0; j < stashes.length; j++) {
+    var st = stashes[j];
+    if (!st || !st.data) continue;
+    var parent = (st.branchName && branches.hasOwnProperty(st.branchName))
+      ? branches[st.branchName] : null;
+    var id = st.id;
+    while (s.objects.hasOwnProperty(id)) id = id + 'x';   // 既存IDと衝突しないようにする
+    s.objects[id] = {
+      id: id, parent: parent, parent2: null,
+      message: st.message || 'スタッシュ（移行）',
+      author: st.author || 'unknown',
+      timestamp: st.timestamp || '',
+      payload: { type: 'full', data: st.data },           // st.data は gzip+Base64 のスナップショット
+      stash: true
+    };
+  }
+
+  delete s.branches;
+  delete s.head;
+  delete s.stashes;
+  s.version = 3;
+  return s;
+}
+
+/**
+ * 現在地 working（コミットID）を解決する。store.working が有効な object を指せばそれを返す。
+ * 未設定（または無効）なら null。jj では working は名前ではなくコミットID。
+ */
+function Ggit_resolveWorking(doc, store) {
+  if (store.working && store.objects.hasOwnProperty(store.working)) return store.working;
+  return null;
+}
+
+// ----- File: src/Tabs.js -----
+/**
+ * Tabs.js — タブ走査・本文 get/set ヘルパー。
+ *
+ * Google ドキュメントのタブは木構造（親タブ／子タブ）を成す。本モジュールは
+ * 全タブを再帰的に平坦化して扱うためのユーティリティを提供する。
+ *
+ * 参照: 設計仕様書 §4.2「タブ操作のAPI前提」。
+ */
+
+/** 全タブ（子タブ含む）を平坦な配列で返す。 */
+function Ggit_allTabs(doc) {
+  doc = doc || DocumentApp.getActiveDocument();
+  var out = [];
+  function rec(tabs) {
+    for (var i = 0; i < tabs.length; i++) {
+      out.push(tabs[i]);
+      rec(tabs[i].getChildTabs());
+    }
+  }
+  rec(doc.getTabs());
+  return out;
+}
+
+/** タブIDから Tab を引く。見つからなければ null。 */
+function Ggit_tabById(doc, id) {
+  var all = Ggit_allTabs(doc);
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].getId() === id) return all[i];
+  }
+  return null;
+}
+
+/** タブ本文のプレーンテキストを取得。 */
+function Ggit_tabText(tab) {
+  return tab.asDocumentTab().getBody().getText();
+}
+
+/** タブ本文をプレーンテキストで上書き。 */
+function Ggit_setTabText(tab, text) {
+  tab.asDocumentTab().getBody().setText(text);
+}
+
+/** Docs API のドキュメントから全タブID（子タブ含む）を平坦に集める。 */
+function Ggit_docsTabIds(docId) {
+  var docRes = Docs.Documents.get(docId, { includeTabsContent: false });
+  var ids = [];
+  function rec(tabs) {
+    if (!tabs) return;
+    for (var i = 0; i < tabs.length; i++) {
+      var tp = tabs[i].tabProperties;
+      if (tp && tp.tabId) ids.push(tp.tabId);
+      rec(tabs[i].childTabs);
+    }
+  }
+  rec(docRes.tabs);
+  return ids;
+}
+
+/**
+ * Docs 拡張サービス経由で新規ドキュメントタブを生成し、生成された Tab を返す。
+ *
+ * `DocumentApp` 本体にタブ追加メソッドは無いため、Docs API の batchUpdate
+ * （addDocumentTab）を用いる（設計仕様書 §4.2）。
+ *
+ * 新タブの特定は二段構えで行う:
+ *  1) batchUpdate と同じバックエンド（強整合）の Docs API で生成前後のタブID差分を取り、
+ *     新タブIDを確定する（レスポンス形状に依存しない）。
+ *  2) Docs API の書き込みが DocumentApp 側へ反映されるまで遅延し得るため、
+ *     反映を待ちながら（リトライ）新タブの DocumentApp.Tab を取得して返す。
+ */
+function Ggit_createTab(doc, title) {
+  var docId = doc.getId();
+  var beforeIds = Ggit_docsTabIds(docId);
+
+  try {
+    Docs.Documents.batchUpdate(
+      { requests: [{ addDocumentTab: { tabProperties: { title: title } } }] },
+      docId
+    );
+  } catch (e) {
+    throw new Error(
+      'タブ生成に失敗しました（addDocumentTab）。Docs 拡張サービスの有効化と、' +
+      '対象ドキュメントのタブAPI対応状況を確認してください。詳細: ' + e.message
+    );
+  }
+
+  // 1) Docs API（強整合）で新タブIDを確定する。
+  var newId = null;
+  var afterIds = Ggit_docsTabIds(docId);
+  for (var i = 0; i < afterIds.length; i++) {
+    if (beforeIds.indexOf(afterIds[i]) === -1) { newId = afterIds[i]; break; }
+  }
+
+  // 2) DocumentApp 側へ反映されるまで待って Tab を取得する。
+  //    （openById は実行内キャッシュ／反映遅延の影響を受けるため、開き直しつつ待機する）
+  for (var attempt = 0; attempt < 6; attempt++) {
+    var fresh = DocumentApp.openById(docId);
+    var after = Ggit_allTabs(fresh);
+    if (newId) {
+      for (var k = 0; k < after.length; k++) {
+        if (after[k].getId() === newId) return after[k];
+      }
+    } else {
+      // newId 不明時のフォールバック: 同名タブ（末尾優先）。
+      for (var j = after.length - 1; j >= 0; j--) {
+        if (after[j].getTitle() === title) return after[j];
+      }
+    }
+    Utilities.sleep(400 * (attempt + 1)); // 0.4s,0.8s,...,2.4s（合計 ~8.4s 上限）
+  }
+
+  throw new Error(
+    'タブは生成されましたが、DocumentApp 側への反映を確認できませんでした。' +
+    '少し待ってからページを再読み込みし、再度お試しください。' +
+    (newId ? '（新タブID: ' + newId + '）' : '')
+  );
 }

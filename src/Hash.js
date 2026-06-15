@@ -19,10 +19,11 @@ function Ggit_sha256Hex(input) {
 
 /**
  * コミットIDを算出する。既存IDと衝突する短縮形は桁を伸ばして一意化する。
- * 入力は branch / parent / timestamp / 本文全文を連結したもの。
+ * 入力は parent / timestamp / 本文全文を連結したもの。
+ * （jjモデルではコミットにブランチ所有概念が無いため、ハッシュ入力から branch を外した。）
  */
-function Ggit_commitId(store, branch, parent, timestamp, fullText) {
-  var hex = Ggit_sha256Hex(branch + '\n' + (parent || '') + '\n' + timestamp + '\n' + fullText);
+function Ggit_commitId(store, parent, timestamp, fullText) {
+  var hex = Ggit_sha256Hex((parent || '') + '\n' + timestamp + '\n' + fullText);
   for (var len = 7; len < hex.length; len++) {
     var cand = hex.substring(0, len);
     if (!store.objects[cand]) return cand;
