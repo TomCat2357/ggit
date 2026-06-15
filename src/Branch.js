@@ -28,11 +28,16 @@ function Ggit_branch(name) {
 
   var srcSnap = Ggit_serializeTab(srcTab);
   var newTab = Ggit_createTab(doc, name);
-  Ggit_restoreTab(newTab, srcSnap); // テキストだけでなく書式ごと複製する
+  var newTabId = newTab.getId();
+  // テキストだけでなく書式ごと複製する。新タブは openById 由来の別インスタンスに属するが、
+  // Ggit_storeSave が .vcs を Docs API（Ggit_setTabTextApi）で書くようになったため、
+  // アクティブ doc への DocumentApp 書き込みは無く、ここが唯一の DocumentApp 書き込みとなる。
+  // よって同一ドキュメント2インスタンスのフラッシュ競合（本文消失）は起きない。
+  Ggit_restoreTab(newTab, srcSnap);
 
-  store.branches[newTab.getId()] = { head: br.head, name: name };
+  store.branches[newTabId] = { head: br.head, name: name };
   Ggit_storeSave(doc, store);
-  return newTab.getId();
+  return newTabId;
 }
 
 /**
