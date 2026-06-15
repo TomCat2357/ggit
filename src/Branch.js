@@ -26,12 +26,14 @@ function Ggit_branch(name) {
     throw new Error('分岐元タブに履歴がありません。先にコミットしてからブランチを作成してください。');
   }
 
-  var srcText = Ggit_tabText(srcTab);
+  var srcSnap = Ggit_serializeTab(srcTab);
   var newTab = Ggit_createTab(doc, name);
   var newTabId = newTab.getId();
-  // 新タブは openById 由来の別インスタンスに属するため、DocumentApp で書くと
-  // フラッシュ競合で本文が消えることがある。Docs API 経由で確実に書き込む。
-  Ggit_setTabTextApi(doc.getId(), newTabId, srcText);
+  // テキストだけでなく書式ごと複製する。新タブは openById 由来の別インスタンスに属するが、
+  // Ggit_storeSave が .vcs を Docs API（Ggit_setTabTextApi）で書くようになったため、
+  // アクティブ doc への DocumentApp 書き込みは無く、ここが唯一の DocumentApp 書き込みとなる。
+  // よって同一ドキュメント2インスタンスのフラッシュ競合（本文消失）は起きない。
+  Ggit_restoreTab(newTab, srcSnap);
 
   store.branches[newTabId] = { head: br.head, name: name };
   Ggit_storeSave(doc, store);
@@ -57,7 +59,8 @@ function Ggit_checkout(targetTabId) {
     clean: null
   };
   if (br) {
-    report.clean = (Ggit_materialize(store, br.head) === Ggit_tabText(tab));
+    // 書式差も「未コミットの変更」に反映するため、スナップショット同士で比較する。
+    report.clean = (Ggit_materialize(store, br.head) === Ggit_serializeTab(tab));
   }
   return report;
 }

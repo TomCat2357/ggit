@@ -99,23 +99,25 @@ function ggitUI_commit() {
   }
 }
 
-/** 指定コミットの本文全文を返す（プレビュー用）。 */
+/** 指定コミットの本文全文（プレーン）を返す（プレビュー用）。 */
 function Ggit_previewCommit(id) {
-  return Ggit_materialize(Ggit_storeLoad(), id);
+  // materialize は書式付きスナップショット文字列を返すため、plainOf で本文を射影する。
+  return Ggit_plainOf(Ggit_materialize(Ggit_storeLoad(), id));
 }
 
 /** 指定コミット本文と現在の作業本文（アクティブタブ）の差分HTML（A=コミット, B=作業中）。 */
 function Ggit_diffCommitVsWorkingHtml(id) {
   var doc = DocumentApp.getActiveDocument();
   var working = Ggit_tabText(doc.getActiveTab());
-  var committed = Ggit_materialize(Ggit_storeLoad(doc), id);
+  // diff はプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var committed = Ggit_plainOf(Ggit_materialize(Ggit_storeLoad(doc), id));
   return Ggit_diffHtml(committed, working);
 }
 
 /**
- * 指定コミットの本文をアクティブタブの作業本文へ復元する（自動コミットしない）。
+ * 指定コミットの内容をアクティブタブの作業本文へ復元する（自動コミットしない）。
  * jj の working-copy モデルに合わせ、記録はユーザの明示 commit に委ねる。
- * アクティブタブ＝単一インスタンスのため Docs API は不要。
+ * テキスト＋書式を Ggit_restoreTab で書き戻す。アクティブタブ＝単一インスタンスのため Docs API は不要。
  */
 function Ggit_restoreCommit(id) {
   var doc = DocumentApp.getActiveDocument();
@@ -126,7 +128,7 @@ function Ggit_restoreCommit(id) {
   }
   var store = Ggit_storeLoad(doc);
   if (!store.objects[id]) throw new Error('コミットが見つかりません: ' + id);
-  Ggit_setTabText(tab, Ggit_materialize(store, id));
+  Ggit_restoreTab(tab, Ggit_materialize(store, id));
   return { restored: id, tabTitle: tab.getTitle() };
 }
 
@@ -311,7 +313,8 @@ function ggitUI_about() {
     'タブをブランチに見立て、commit / log / diff / branch / checkout / merge を提供します。<br><br>' +
     'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。' +
     '<code>.vcs</code> タブは手動編集しないでください。<br>' +
-    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3）。' +
+    'commit は本文の書式（文字・段落書式）も記録し、branch では書式ごと復元します。' +
+    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +
     '</div>';
   Ggit_showModal(html, 'About ggit', 480, 220);
 }
