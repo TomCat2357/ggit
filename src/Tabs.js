@@ -55,7 +55,7 @@ function Ggit_setTabText(tab, text) {
 function Ggit_setTabTextApi(docId, tabId, text) {
   var docRes = Docs.Documents.get(docId, {
     includeTabsContent: true,
-    fields: 'tabs(tabId,childTabs,documentTab(body(content(endIndex))))'
+    fields: 'tabs(tabProperties/tabId,childTabs,documentTab(body(content(endIndex))))'
   });
   var endIndex = Ggit_tabBodyEndIndex_(docRes, tabId);
 
@@ -81,8 +81,9 @@ function Ggit_setTabTextApi(docId, tabId, text) {
 
 /**
  * Docs.Documents.get レスポンスから、指定タブの本文末尾 index を求める。
- * タブ木（childTabs）を再帰的に辿って tabId 一致タブを探し、その
+ * タブ木（childTabs）を再帰的に辿って tabProperties.tabId 一致タブを探し、その
  * documentTab.body.content 末尾要素の endIndex を返す。空本文時は 1 を返す。
+ * 注: Docs API の Tab はタブIDを最上位ではなく tabProperties.tabId に持つ。
  */
 function Ggit_tabBodyEndIndex_(docRes, tabId) {
   var found = null;
@@ -90,7 +91,8 @@ function Ggit_tabBodyEndIndex_(docRes, tabId) {
     if (!tabs) return;
     for (var i = 0; i < tabs.length; i++) {
       if (found) return;
-      if (tabs[i].tabId === tabId) { found = tabs[i]; return; }
+      var tp = tabs[i].tabProperties;
+      if (tp && tp.tabId === tabId) { found = tabs[i]; return; }
       rec(tabs[i].childTabs);
     }
   })(docRes.tabs);

@@ -66,18 +66,30 @@ function Ggit_storeSave(doc, store) {
   Ggit_setTabTextApi(docId, t.getId(), JSON.stringify(store));
 }
 
+/** `.vcs` メタタブが存在するか（＝初期化済みか）。 */
+function Ggit_isInitialized(doc) {
+  return !!Ggit_metaTab(doc || DocumentApp.getActiveDocument());
+}
+
 /**
- * 認可を確実に発火させるための no-op 認可関数（Setup メニューから呼ぶ）。
+ * 初期化（権限付与）— これ「だけ」で初回セットアップを完結させる。
  *
- * onOpen は AuthMode.NONE で動くため、初回の本格操作（commit 等）で認可ダイアログが
- * 出ると、その関数は再実行されずに中断される。本関数を先に一度実行して認可を済ませることで、
- * 最初の commit が認可中断で消える事象を避ける。ドキュメント名とタブ数を返す。
+ * onOpen は AuthMode.NONE で動くため、初回の本格操作（commit 等）で認可ダイアログが出ると、
+ * その関数は再実行されずに中断される。そこで初回はまず本関数で (1) 必要スコープに触れて認可を
+ * 済ませ、(2) 空ストアの `.vcs` メタタブを作るところまでやって終わる。以降、commit などは
+ * 「`.vcs` を新規生成する」副作用を持たずに済む（＝初回コミットでの生成競合・認可中断が起きない）。
+ *
+ * 既に初期化済み（`.vcs` あり）なら作成はスキップする。戻り値: { created, title, tabCount }。
  */
-function Ggit_authorize() {
+function Ggit_setup() {
   var doc = DocumentApp.getActiveDocument();
-  var tabs = Ggit_allTabs(doc); // documents スコープに触れる読み取り
-  try { Session.getActiveUser().getEmail(); } catch (_) {}
-  return { title: doc.getName(), tabCount: tabs.length };
+  try { Session.getActiveUser().getEmail(); } catch (_) {} // 認可スコープに触れる
+  var existed = Ggit_isInitialized(doc);
+  if (!existed) {
+    Ggit_storeSave(doc, Ggit_emptyStore()); // `.vcs` を空ストアで生成（Docs API 書き込み）
+  }
+  var tabs = Ggit_allTabs(doc);
+  return { created: !existed, title: doc.getName(), tabCount: tabs.length };
 }
 
 /**

@@ -4,3 +4,4 @@ node_modules/
 .clasprc.json
 npm-debug.log*
 .DS_Store
+dist/*

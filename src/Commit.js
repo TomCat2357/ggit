@@ -42,6 +42,13 @@ function Ggit_commit(message) {
   // 親＝現在地 working。初回（未確立）は parent=null。
   var parent = Ggit_resolveWorking(doc, store);
 
+  // 防御: 現在地が（移行データ等で）スタッシュを指している場合、スタッシュは履歴の親に
+  // なってはならない。実在する直近の非スタッシュ祖先へ繋ぎ直す（無ければ初回扱い null）。
+  // Ggit_goto はスタッシュへの移動を禁止しているため通常はここを通らない。
+  if (parent && store.objects[parent] && store.objects[parent].stash) {
+    parent = Ggit_firstNonStashAncestor_(store, parent);
+  }
+
   if (parent && Ggit_materialize(store, parent) === snap) {
     throw new Error('変更がありません（前回コミットと同一の内容です）。');
   }
@@ -63,6 +70,22 @@ function Ggit_commit(message) {
 
   Ggit_storeSave(doc, store);
   return id;
+}
+
+/**
+ * id（自身を含む）から親方向へ辿り、最初に現れる「実在する非スタッシュ」コミットIDを返す。
+ * スタッシュ（stash:true）は飛ばす。連鎖が途中で欠落（参照先が無い）したら null を返す。
+ * commit がスタッシュを親に取ってしまわないための繋ぎ直し先を求めるのに使う。
+ */
+function Ggit_firstNonStashAncestor_(store, id) {
+  var cur = id;
+  while (cur) {
+    var o = store.objects[cur];
+    if (!o) return null;       // 連鎖が壊れている（参照先欠落）
+    if (!o.stash) return cur;  // 実コミットに到達
+    cur = o.parent;
+  }
+  return null;
 }
 
 /** 指定コミットIDから親方向に辿ったコミット配列（フラットログ・status 用）。 */

@@ -9,14 +9,96 @@
  */
 
 /**
- * store.objects 全体を描画用ノード配列へ整形する。
+ * 「可視ヘッド」= 子を持たない非スタッシュコミットIDの集合 { id:true } を返す純粋関数。
+ * jj の匿名ヘッド（visible heads）に相当する。commit はブックマークを動かさないため、コミット
+ * 直後に @ を別の場所へ移すと直前コミットを指すものが無くなるが、それでも「葉」はここでヘッドとして
+ * 拾われ、到達ルート（Ggit_reachableIds）に含めることで孤立させない。
+ * スタッシュ（側枝）は子として数えない／ヘッドにもしない（スタッシュ自体は別ルートで保持）。
+ */
+function Ggit_headIds(store) {
+  var objects = store.objects || {};
+  var hasChild = {};
+  for (var cid in objects) {
+    if (!objects.hasOwnProperty(cid)) continue;
+    var c = objects[cid];
+    if (c.stash) continue; // スタッシュの親参照は「子を持つ」に数えない
+    if (c.parent && objects.hasOwnProperty(c.parent)) hasChild[c.parent] = true;
+    if (c.parent2 && objects.hasOwnProperty(c.parent2)) hasChild[c.parent2] = true;
+  }
+  var heads = {};
+  for (var id in objects) {
+    if (!objects.hasOwnProperty(id)) continue;
+    if (objects[id].stash) continue;
+    if (!hasChild[id]) heads[id] = true;
+  }
+  return heads;
+}
+
+/**
+ * ルート（現在地 @ / ブックマーク / スタッシュ / 可視ヘッド）から parent・parent2 を辿って到達
+ * できるオブジェクトIDの集合 { id:true } を返す純粋関数。到達できないものが「孤立コミット」。
+ * 可視ヘッド（子を持たない非スタッシュコミット＝匿名ヘッド）も常にルートに含めるため、commit→
+ * 移動でブックマーク無しの葉を置き去りにしても孤立しない（jj の visible heads 相当）。
+ * スタッシュはそれ自体がルート（一覧から pop/破棄できるよう常に保持する）。
+ * 参照先が欠落しているエッジは辿らない（存在するオブジェクトのみ集合へ入れる）。
+ */
+function Ggit_reachableIds(store) {
+  var objects = store.objects || {};
+  var bm = store.bookmarks || {};
+  var seen = {};
+  var stack = [];
+  function pushRoot(id) {
+    if (id && objects.hasOwnProperty(id) && !seen[id]) { seen[id] = true; stack.push(id); }
+  }
+  pushRoot(store.working || null);
+  for (var name in bm) { if (bm.hasOwnProperty(name)) pushRoot(bm[name]); }
+  for (var sid in objects) { if (objects.hasOwnProperty(sid) && objects[sid].stash) pushRoot(sid); }
+  var heads = Ggit_headIds(store);
+  for (var hid in heads) { if (heads.hasOwnProperty(hid)) pushRoot(hid); } // 匿名ヘッドを保持
+
+  while (stack.length) {
+    var o = objects[stack.pop()];
+    if (!o) continue;
+    pushRoot(o.parent);
+    pushRoot(o.parent2);
+  }
+  return seen;
+}
+
+/**
+ * log に表示する（＝「繋がっている」）オブジェクトIDの集合 { id:true } を返す純粋関数。
+ * 表示条件: ルートから到達可能（reachable）かつ本文を復元可能（canMaterialize）。
+ * 例外として現在地 @ は壊れていても常に表示する（ユーザーが自分の居場所を見失わず、
+ * 「修復」へ誘導できるようにするため）。
+ * ここに含まれないものが「繋がりのなくなったコミット」＝非表示かつ掃除（Ggit_gcDisconnected）対象。
+ */
+function Ggit_displayableIds(store) {
+  var objects = store.objects || {};
+  var working = store.working || null;
+  var reachable = Ggit_reachableIds(store);
+  var show = {};
+  for (var id in objects) {
+    if (!objects.hasOwnProperty(id)) continue;
+    if (id === working) { show[id] = true; continue; }      // 現在地は壊れていても常に表示
+    if (!reachable[id]) continue;                            // 孤立 → 非表示
+    if (!Ggit_canMaterialize(store, id)) continue;          // 壊れ（復元不能）→ 非表示
+    show[id] = true;
+  }
+  return show;
+}
+
+/**
+ * store.objects のうち「繋がっている」ものだけを描画用ノード配列へ整形する。
+ * 孤立コミット・壊れたコミットは Ggit_displayableIds で除外される（現在地 @ は除外しない）。
  * 子が親より前に来る順（おおむね新しい順）に並べる（レーン割当が前提とする向き）。
- * 各ノード: { id, parents:[...], refs:[ブックマーク名...], isWorking, isStash, message, timestamp, author }
+ * 各ノード: { id, parents:[...], refs:[名...], isWorking, isStash, isHead, hasStash, isBroken, message, timestamp, author }
  */
 function Ggit_collectNodes(store) {
   var objects = store.objects || {};
   var working = store.working || null;
   var bm = store.bookmarks || {};
+  var show = Ggit_displayableIds(store);
+  var heads = Ggit_headIds(store); // 可視ヘッド（子を持たない非スタッシュコミット＝破棄可能な葉）
 
   // コミットID → そこを指すブックマーク名一覧
   var refsByCommit = {};
@@ -26,21 +108,35 @@ function Ggit_collectNodes(store) {
     (refsByCommit[c] = refsByCommit[c] || []).push(name);
   }
 
+  // コミットID → そこに付随するスタッシュがあるか（破棄時に一緒に消える旨を UI で警告するため）
+  var stashByParent = {};
+  for (var sk in objects) {
+    if (!objects.hasOwnProperty(sk)) continue;
+    var so = objects[sk];
+    if (!so.stash) continue;
+    if (so.parent) stashByParent[so.parent] = true;
+    if (so.parent2) stashByParent[so.parent2] = true;
+  }
+
   var ids = [];
-  for (var id in objects) { if (objects.hasOwnProperty(id)) ids.push(id); }
+  for (var id in objects) { if (objects.hasOwnProperty(id) && show[id]) ids.push(id); }
 
   var nodes = {};
   ids.forEach(function (id) {
     var o = objects[id];
+    // 親も表示対象のときだけエッジを引く（壊れた/孤立した親へは線を繋がない＝その場で根になる）。
     var parents = [];
-    if (o.parent && objects.hasOwnProperty(o.parent)) parents.push(o.parent);
-    if (o.parent2 && objects.hasOwnProperty(o.parent2)) parents.push(o.parent2);
+    if (o.parent && show[o.parent]) parents.push(o.parent);
+    if (o.parent2 && show[o.parent2]) parents.push(o.parent2);
     nodes[id] = {
       id: id,
       parents: parents,
       refs: refsByCommit[id] || [],
       isWorking: id === working,
       isStash: !!o.stash,
+      isHead: !!heads[id],
+      hasStash: !!stashByParent[id],
+      isBroken: !Ggit_canMaterialize(store, id),
       message: o.message,
       timestamp: o.timestamp,
       author: o.author

@@ -53,6 +53,28 @@ function Ggit_makePayload(store, parentId, fullText) {
 }
 
 /**
+ * 指定コミットの本文を実際に復元せずに「復元可能か」を構造的に判定する純粋関数。
+ *
+ * materialize と同じ向き（payload が delta の間だけ parent を辿り、full に当たれば確定）で
+ * 連鎖を辿り、full に到達できれば true。途中で参照先オブジェクトが欠落していたり
+ * （例: 親が破棄された 5653e7bf を指す）、payload が無い／delta なのに親が無い場合は
+ * 連鎖が「繋がっていない」ため false（＝壊れたコミット）。
+ *
+ * GAS ランタイム非依存（gzip/Docs API を呼ばない）なので SelfTest でユニット検証できる。
+ */
+function Ggit_canMaterialize(store, id) {
+  var objects = store.objects || {};
+  var cur = id;
+  for (var guard = 0; cur && guard < 1000000; guard++) {
+    var o = objects[cur];
+    if (!o || !o.payload) return false; // 参照先欠落 or payload 欠落 → 復元不能
+    if (o.payload.type === 'full') return true; // 基準点に到達
+    cur = o.parent; // delta は親方向へ
+  }
+  return false; // full に当たらず連鎖が尽きた（delta なのに親が無い等）
+}
+
+/**
  * 指定コミットの本文全文を復元する。
  * コミットから親方向へ直近の full まで遡り、full 本文に delta を順方向適用する。
  */

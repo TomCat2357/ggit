@@ -11,7 +11,7 @@
 function onOpen() {
   DocumentApp.getUi()
     .createMenu('ggit')
-    .addItem('Setup / 権限付与', 'ggitUI_setup')
+    .addItem('初期化（権限付与・.vcs作成）', 'ggitUI_setup')
     .addSeparator()
     .addItem('Commit…', 'ggitUI_commit')
     .addItem('Log（グラフ）', 'ggitUI_log')
@@ -23,8 +23,25 @@ function onOpen() {
     .addSeparator()
     .addItem('Merge…', 'ggitUI_merge')
     .addSeparator()
+    .addItem('修復（壊れた履歴の復旧）', 'ggitUI_repair')
     .addItem('About', 'ggitUI_about')
     .addToUi();
+}
+
+/**
+ * 初期化済み（`.vcs` あり）でなければ、案内を出して false を返す共通ガード。
+ *
+ * メニュー項目は onOpen（AuthMode.NONE）で静的に作られ状態で出し分けできないため、各操作の
+ * 入口でこれを呼ぶ。`.vcs` 未作成のうちに commit 等が中途半端に動いて「できている」と
+ * 誤解させないよう、まず「初期化（権限付与・.vcs作成）」へ誘導する。
+ */
+function Ggit_uiRequireInit_(ui) {
+  if (Ggit_isInitialized(DocumentApp.getActiveDocument())) return true;
+  ui.alert('ggit',
+    'まだ初期化されていません。\n' +
+    'メニューの「初期化（権限付与・.vcs作成）」を先に実行してください。',
+    ui.ButtonSet.OK);
+  return false;
 }
 
 /* ===================== 共通ユーティリティ ===================== */
@@ -46,7 +63,8 @@ function Ggit_showModal(htmlStr, title, w, h) {
 function Ggit_uiNode(node) {
   return {
     id: node.id, message: node.message, timestamp: node.timestamp, author: node.author,
-    refs: node.refs || [], isWorking: !!node.isWorking, isStash: !!node.isStash
+    refs: node.refs || [], isWorking: !!node.isWorking, isStash: !!node.isStash,
+    isHead: !!node.isHead, hasStash: !!node.hasStash, isBroken: !!node.isBroken
   };
 }
 
@@ -64,9 +82,14 @@ function Ggit_uiGraphData() {
   for (var name in store.bookmarks) {
     if (store.bookmarks.hasOwnProperty(name)) bookmarks.push({ name: name, commitId: store.bookmarks[name] });
   }
+  var disconnected = Ggit_countDisconnected(store); // 非表示にした孤立／壊れコミットの件数
+  var working = store.working || null;
+  var workingBroken = !!(working && store.objects.hasOwnProperty(working) &&
+    !Ggit_canMaterialize(store, working));
   return {
-    rows: rows, flat: flat, working: store.working || null,
-    bookmarks: bookmarks, stashes: Ggit_listStashes(store)
+    rows: rows, flat: flat, working: working,
+    bookmarks: bookmarks, stashes: Ggit_listStashes(store),
+    disconnected: disconnected, workingBroken: workingBroken
   };
 }
 
@@ -98,21 +121,22 @@ function Ggit_uiListRefs() {
 function ggitUI_setup() {
   var ui = DocumentApp.getUi();
   try {
-    var info = Ggit_authorize();
-    ui.alert('ggit setup',
-      '初期化が完了しました。\n' +
-      'ドキュメント: ' + info.title + '\n' +
-      'タブ数: ' + info.tabCount + '\n\n' +
-      'これで Commit などの操作が利用できます。\n' +
-      '※ 権限承認の直後はGASの仕様により最初の操作がキャンセルされることがあります。' +
-      'その場合は同じ操作をもう一度実行してください。', ui.ButtonSet.OK);
+    var info = Ggit_setup();
+    ui.alert('ggit 初期化',
+      info.created
+        ? ('初期化が完了しました。\n' +
+           '「.vcs」を作成しました（ドキュメント: ' + info.title + '）。\n' +
+           'これで Commit などが使えます。')
+        : '既に初期化済みです（「.vcs」あり）。Commit などがそのまま使えます。',
+      ui.ButtonSet.OK);
   } catch (e) {
-    ui.alert('ggit setup', '初期化中にエラー: ' + e.message, ui.ButtonSet.OK);
+    ui.alert('ggit 初期化', '初期化中にエラー: ' + e.message, ui.ButtonSet.OK);
   }
 }
 
 function ggitUI_commit() {
   var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
   var res = ui.prompt('ggit commit', 'コミットメッセージを入力してください:', ui.ButtonSet.OK_CANCEL);
   if (res.getSelectedButton() !== ui.Button.OK) return;
   var msg = (res.getResponseText() || '').trim();
@@ -126,6 +150,8 @@ function ggitUI_commit() {
 }
 
 function ggitUI_log() {
+  var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
   // データ取得・移動・スタッシュ操作はすべてクライアントから google.script.run で呼ぶ。
   // コミット行クリックでその時点へ現在地 @ を移動（未コミット内容はスタッシュへ退避）。
   var html =
@@ -133,10 +159,16 @@ function ggitUI_log() {
     '<div style="margin-bottom:4px">' +
     '<button id="bGraph" onclick="setView(\'graph\')">グラフ</button> ' +
     '<button id="bFlat" onclick="setView(\'flat\')">フラット</button>' +
+    '<button id="bGc" onclick="gc()" title="繋がりのなくなったコミットを削除" ' +
+    'style="margin-left:10px;display:none;color:#b06000"></button>' +
     '<span id="working" style="margin-left:10px;color:#188038"></span></div>' +
     '<div id="status" style="min-height:18px;color:#188038;margin-bottom:6px"></div>' +
+    '<div id="broken" style="color:#d93025;margin-bottom:6px"></div>' +
     '<div style="color:#888;margin-bottom:4px">' +
     '行をクリックすると現在地 @ をそのコミットへ移動します（現在の未コミット内容はスタッシュに退避）。' +
+    'スタッシュ行は移動対象外です（下の一覧で「戻す(pop)」/「破棄」してください）。' +
+    'コミットは @ を移しても消えません（匿名ヘッドとして残ります）。不要な枝は葉の「破棄」で削除できます。' +
+    '内容を復元できない壊れたコミットだけは表示されず、「掃除」で削除できます。' +
     '<code>&lt;name&gt;</code>=ブックマーク, <code>@</code>=現在地, <code>[stash]</code>=スタッシュ。</div>' +
     '<div id="list">読み込み中…</div>' +
     '<div id="stashes"></div>' +
@@ -147,24 +179,33 @@ function ggitUI_log() {
     'function onErr(e){setStatus(e.message||String(e),true);}' +
     'function refs(c){var h="";if(c.refs&&c.refs.length){h+=" "+c.refs.map(function(n){return "<span style=\\"background:#e8f0fe;color:#1a73e8;border-radius:3px;padding:0 4px\\">"+esc(n)+"</span>";}).join(" ");}' +
     'if(c.isWorking){h+=" <span style=\\"color:#188038;font-weight:bold\\">@</span>";}' +
-    'if(c.isStash){h+=" <span style=\\"color:#b06000\\">[stash]</span>";}return h;}' +
-    'function commitCell(c){return "<span style=\\"font-family:monospace;color:#1a73e8\\">"+esc(c.id)+"</span>"+refs(c)+"  "+esc(c.message)+" <span style=\\"color:#aaa\\">"+esc(c.timestamp)+"</span>";}' +
+    'if(c.isStash){h+=" <span style=\\"color:#b06000\\">[stash]</span>";}' +
+    'if(c.isBroken){h+=" <span style=\\"color:#d93025;font-weight:bold\\">[壊れ]</span>";}return h;}' +
+    'function commitCell(c){var ab=(c.isHead&&!c.isWorking&&!c.isStash)?" <button onclick=\\"event.stopPropagation();abandon(\'"+esc(c.id)+"\',"+(c.hasStash?"true":"false")+")\\" title=\\"この葉コミットの枝を破棄\\" style=\\"color:#b06000\\">破棄</button>":"";' +
+    'return "<span style=\\"font-family:monospace;color:#1a73e8\\">"+esc(c.id)+"</span>"+refs(c)+"  "+esc(c.message)+" <span style=\\"color:#aaa\\">"+esc(c.timestamp)+"</span>"+ab;}' +
     'function rowClick(id){return "onclick=\\"goTo(\'"+esc(id)+"\')\\" onmouseover=\\"this.style.background=\'#f1f3f4\'\\" onmouseout=\\"this.style.background=\'\'\\" style=\\"cursor:pointer\\"";}' +
     'function renderGraph(){var rows=DATA.rows;if(!rows.length)return "<div style=\\"color:#888\\">コミットがありません。</div>";' +
     'var h="<table style=\\"border-collapse:collapse;width:100%\\">";' +
     'for(var i=0;i<rows.length;i++){var r=rows[i];' +
     'var g="<td style=\\"font-family:monospace;white-space:pre;color:#444\\">"+esc(r.graph)+"</td>";' +
-    'if(r.c){h+="<tr "+rowClick(r.c.id)+">"+g+"<td>"+commitCell(r.c)+"</td></tr>";}' +
+    'if(r.c){h+="<tr "+(r.c.isStash?"":rowClick(r.c.id))+">"+g+"<td>"+commitCell(r.c)+"</td></tr>";}' +
     'else{h+="<tr>"+g+"<td></td></tr>";}}' +
     'return h+"</table>";}' +
     'function renderFlat(){var f=DATA.flat;if(!f.length)return "<div style=\\"color:#888\\">コミットがありません。</div>";' +
     'var h="<table style=\\"border-collapse:collapse;width:100%\\">";' +
-    'for(var i=0;i<f.length;i++){var c=f[i];h+="<tr "+rowClick(c.id)+"><td>"+commitCell(c)+"</td></tr>";}' +
+    'for(var i=0;i<f.length;i++){var c=f[i];h+="<tr "+(c.isStash?"":rowClick(c.id))+"><td>"+commitCell(c)+"</td></tr>";}' +
     'return h+"</table>";}' +
     'function render(){' +
     'document.getElementById("working").innerText=DATA.working?("現在地 @ "+DATA.working):"(現在地なし)";' +
     'document.getElementById("bGraph").disabled=(VIEW==="graph");' +
     'document.getElementById("bFlat").disabled=(VIEW==="flat");' +
+    'var dc=DATA.disconnected||{total:0,orphans:0,broken:0};' +
+    'var gb=document.getElementById("bGc");' +
+    'if(dc.total>0){gb.style.display="";gb.innerText="掃除 ("+dc.total+")";' +
+    'gb.title="繋がりのなくなったコミット "+dc.total+" 件（孤立 "+dc.orphans+" / 壊れ "+dc.broken+"）を削除";}' +
+    'else{gb.style.display="none";}' +
+    'var bk=document.getElementById("broken");' +
+    'bk.innerHTML=DATA.workingBroken?"現在地 @ の内容を復元できません（壊れています）。メニューの「修復」で立て直してください。":"";' +
     'document.getElementById("list").innerHTML=(VIEW==="graph")?renderGraph():renderFlat();' +
     'var s=document.getElementById("stashes");' +
     'if(!DATA.stashes.length){s.innerHTML="";}' +
@@ -185,6 +226,12 @@ function ggitUI_log() {
     'setStatus("適用中…");google.script.run.withSuccessHandler(function(r){setStatus("スタッシュを戻して消しました"+(r.stashed?"（直前の内容を退避）":""));refresh();}).withFailureHandler(onErr).Ggit_popStash(id);}' +
     'function dropStash(id){if(!confirm("スタッシュ "+id+" を破棄します。元に戻せません。よろしいですか？"))return;' +
     'google.script.run.withSuccessHandler(function(){setStatus("スタッシュを破棄しました");refresh();}).withFailureHandler(onErr).Ggit_dropStash(id);}' +
+    'function abandon(id,hasStash){var m=hasStash?("コミット "+id+" には未コミット内容のスタッシュが付いています。\\n枝を破棄すると、その付随スタッシュも一緒に破棄されます（元に戻せません）。よろしいですか？"):("コミット "+id+" の枝を破棄します（葉から分岐元まで遡って削除）。\\n現在地 @ ・ブックマーク先・他の枝が乗る地点は残します。元に戻せません。よろしいですか？");if(!confirm(m))return;' +
+    'setStatus("破棄中…");google.script.run.withSuccessHandler(function(r){setStatus("破棄しました: "+r.removed+" 件削除"+(r.droppedStashes?("（スタッシュ "+r.droppedStashes+" 件も破棄）"):""));refresh();}).withFailureHandler(onErr).Ggit_abandonCommit(id);}' +
+    'function gc(){var dc=DATA.disconnected||{total:0,orphans:0,broken:0};if(!dc.total)return;' +
+    'if(!confirm("繋がりのなくなったコミット "+dc.total+" 件（孤立 "+dc.orphans+" / 壊れ "+dc.broken+"）を削除します。\\n現在地 @ は残します。元に戻せません。よろしいですか？"))return;' +
+    'setStatus("掃除中…");' +
+    'google.script.run.withSuccessHandler(function(r){setStatus("掃除しました: "+r.removed+" 件削除（孤立 "+r.orphans+" / 壊れ "+r.broken+"）"+(r.workingBroken?" ※現在地 @ が壊れています。修復してください。":""));refresh();}).withFailureHandler(onErr).Ggit_gcDisconnected();}' +
     'refresh();' +
     '</script></div>';
   Ggit_showModal(html, 'ggit log', 720, 560);
@@ -192,6 +239,7 @@ function ggitUI_log() {
 
 function ggitUI_diff() {
   var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
   var commits = Ggit_uiListCommits();
   if (commits.length < 2) {
     ui.alert('ggit diff', '差分表示には2つ以上のコミットが必要です。', ui.ButtonSet.OK);
@@ -230,6 +278,7 @@ function ggitUI_diff() {
 
 function ggitUI_bookmark() {
   var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
   var refs = Ggit_uiListRefs();
   if (!refs.commits.length) {
     ui.alert('ggit bookmark', 'コミットがありません。先にコミットしてください。', ui.ButtonSet.OK);
@@ -271,6 +320,7 @@ function ggitUI_bookmark() {
 
 function ggitUI_goto() {
   var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
   var refs = Ggit_uiListRefs();
   if (!refs.commits.length) {
     ui.alert('ggit goto', '移動先のコミットがありません。先にコミットしてください。', ui.ButtonSet.OK);
@@ -305,6 +355,7 @@ function ggitUI_goto() {
 
 function ggitUI_status() {
   var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
   var doc = DocumentApp.getActiveDocument();
   var store = Ggit_storeLoad(doc);
   var working = Ggit_resolveWorking(doc, store);
@@ -326,6 +377,7 @@ function ggitUI_status() {
 
 function ggitUI_merge() {
   var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
   var refs = Ggit_uiListRefs();
   if (!refs.working) {
     ui.alert('ggit merge', '現在地がありません。先にコミットしてください。', ui.ButtonSet.OK);
@@ -364,6 +416,30 @@ function ggitUI_merge() {
   Ggit_showModal(html, 'ggit merge', 560, 260);
 }
 
+function ggitUI_repair() {
+  var ui = DocumentApp.getUi();
+  if (!Ggit_uiRequireInit_(ui)) return;
+  var res = ui.alert('ggit 修復',
+    '壊れた履歴（破棄されたスタッシュ等で親を失ったコミット）を復旧します。\n\n' +
+    '・現在地 @ の本文が復元できない場合、いま開いているタブの本文を @ の内容として作り直します。\n' +
+    '  → 必ず @ の作業タブを開いた状態で実行してください。\n' +
+    '・親を失ったその他のコミットは根として切り離します（差分連鎖が壊れたものは本文を復元できません）。\n\n' +
+    '実行しますか？', ui.ButtonSet.OK_CANCEL);
+  if (res !== ui.Button.OK) return;
+  try {
+    var r = Ggit_repairStore();
+    ui.alert('ggit 修復',
+      '完了しました。\n' +
+      '現在地 @ の再構築: ' + (r.recoveredWorking ? 'あり（タブ本文から復元）' : 'なし') + '\n' +
+      '切り離した参照: ' + r.detached + ' 件\n' +
+      (r.lost.length ? '本文を復元できなかったコミット: ' + r.lost.join(', ')
+                     : '本文の欠落はありませんでした'),
+      ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit 修復', e.message, ui.ButtonSet.OK);
+  }
+}
+
 function ggitUI_about() {
   var html =
     '<div style="font:13px/1.6 Roboto,Arial,sans-serif;padding:8px">' +
@@ -374,6 +450,11 @@ function ggitUI_about() {
     '意識した ASCII レーングラフで表示し、フラット表示にも切替できます。<br><br>' +
     'スタッシュは <code>.vcs</code> の中に「<b>スタッシュだと分かる仮コミット（stash:true）</b>」として' +
     '記録され、戻す（pop）と消えます。<br><br>' +
+    '初回は <b>「初期化（権限付与・.vcs作成）」</b>を実行してください。権限付与と <code>.vcs</code> 作成までを' +
+    'これ1つで完結します。<br>' +
+    'commit は <code>@</code> を移しても消えず、<b>匿名ヘッド</b>として Log に残ります。不要な枝は葉の' +
+    '<b>「破棄」</b>で削除できます。内容を復元できない<b>壊れたコミット</b>だけは表示されず、' +
+    '<b>「掃除」</b>でまとめて削除できます（現在地 @ は残ります）。<br><br>' +
     'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。<code>.vcs</code> タブは手動編集しないでください。<br>' +
     'commit は本文の書式（文字・段落書式）も記録し、goto では書式ごと復元します。' +
     '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +

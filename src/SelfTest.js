@@ -18,7 +18,12 @@ function _test_all() {
   _test_lca();
   _test_migrate();
   _test_graphLines();
+  _test_canMaterialize();
+  _test_reachable();
+  _test_gcDisconnected();
+  _test_abandon();
   _test_stashGuard();
+  _test_firstNonStashAncestor();
   _test_tabBodyEndIndex();
   Logger.log('--- self-test 完了 ---');
 }
@@ -181,12 +186,14 @@ function _test_graphLines() {
   function gline(store) {
     return Ggit_graphLines(Ggit_collectNodes(store)).map(function (r) { return r.graph; });
   }
+  // payload は collectNodes の表示判定（materialize 可否）を満たすため full を与える。
+  var FULL = { type: 'full', data: 'x' };
   var branch = {
     objects: {
-      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01' },
-      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02' },
-      C: { id: 'C', parent: 'B', parent2: null, timestamp: '2026-06-03' },
-      D: { id: 'D', parent: 'B', parent2: null, timestamp: '2026-06-04' }
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+      C: { id: 'C', parent: 'B', parent2: null, timestamp: '2026-06-03', payload: FULL },
+      D: { id: 'D', parent: 'B', parent2: null, timestamp: '2026-06-04', payload: FULL }
     },
     working: 'D', bookmarks: { main: 'C' }
   };
@@ -199,16 +206,193 @@ function _test_graphLines() {
   // マージ: A→B、A→D、E が B と D を合流（parent2）。
   var merge = {
     objects: {
-      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01' },
-      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02' },
-      D: { id: 'D', parent: 'A', parent2: null, timestamp: '2026-06-03' },
-      E: { id: 'E', parent: 'B', parent2: 'D', timestamp: '2026-06-04' }
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+      D: { id: 'D', parent: 'A', parent2: null, timestamp: '2026-06-03', payload: FULL },
+      E: { id: 'E', parent: 'B', parent2: 'D', timestamp: '2026-06-04', payload: FULL }
     },
     working: 'E', bookmarks: {}
   };
   var ml = gline(merge);
   _ok('graph マージ: sprout 行 |\\ がある', ml.join('\n').indexOf('|\\') >= 0);
   _ok('graph マージ: collapse 行 |/ がある', ml.join('\n').indexOf('|/') >= 0);
+}
+
+/** Ggit_canMaterialize（純粋関数）: payload 連鎖が full に届くかで復元可否を判定。 */
+function _test_canMaterialize() {
+  var FULL = { type: 'full', data: 'x' };
+  var DELTA = { type: 'delta', data: 'd' };
+  var store = {
+    objects: {
+      A: { id: 'A', parent: null, payload: FULL },     // full → 可
+      B: { id: 'B', parent: 'A', payload: DELTA },     // full 経由で可
+      C: { id: 'C', parent: 'GONE', payload: DELTA },  // 親欠落 → 不可
+      D: { id: 'D', parent: 'C', payload: DELTA },     // 壊れ連鎖の子 → 不可
+      E: { id: 'E', parent: null, payload: DELTA }     // delta なのに親無し → 不可
+    }
+  };
+  _ok('canMaterialize: full は可', Ggit_canMaterialize(store, 'A') === true);
+  _ok('canMaterialize: full 経由 delta は可', Ggit_canMaterialize(store, 'B') === true);
+  _ok('canMaterialize: 親欠落 delta は不可', Ggit_canMaterialize(store, 'C') === false);
+  _ok('canMaterialize: 壊れ連鎖の子も不可', Ggit_canMaterialize(store, 'D') === false);
+  _ok('canMaterialize: 親無し delta は不可', Ggit_canMaterialize(store, 'E') === false);
+  _ok('canMaterialize: 不在IDは不可', Ggit_canMaterialize(store, 'NOPE') === false);
+}
+
+/**
+ * Ggit_headIds / Ggit_reachableIds / Ggit_displayableIds / Ggit_collectNodes（純粋関数）:
+ * 可視ヘッド（子を持たない非スタッシュコミット＝匿名ヘッド）が到達ルートに含まれ、commit→移動で
+ * ブックマーク無しの葉を置き去りにしても孤立しない（消えない）ことを確認する。
+ */
+function _test_reachable() {
+  var FULL = { type: 'full', data: 'x' };
+  var store = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL }, // @（葉）
+      C: { id: 'C', parent: 'A', parent2: null, timestamp: '2026-06-03', payload: FULL }, // 別枝の途中
+      D: { id: 'D', parent: 'C', parent2: null, timestamp: '2026-06-04', payload: FULL }, // 別枝の葉＝可視ヘッド
+      S: { id: 'S', parent: 'B', parent2: null, timestamp: '2026-06-05', payload: FULL, stash: true }
+    },
+    working: 'B', bookmarks: {}
+  };
+  var h = Ggit_headIds(store);
+  _ok('heads: 葉 B/D がヘッド', h.B && h.D);
+  _ok('heads: 内部 A/C とスタッシュ S はヘッドでない', !h.A && !h.C && !h.S);
+
+  var r = Ggit_reachableIds(store);
+  _ok('reachable: @ とその祖先', r.A && r.B);
+  _ok('reachable: スタッシュもルート', r.S);
+  _ok('reachable: 可視ヘッド D 経由で C/D も到達可能', r.C && r.D); // 匿名ヘッドを保持
+
+  var show = Ggit_displayableIds(store);
+  _ok('displayable: 別枝も表示（孤立しない）', show.C && show.D);
+  _ok('displayable: 到達可能は表示', show.A && show.B && show.S);
+
+  var ids = Ggit_collectNodes(store).map(function (n) { return n.id; });
+  _ok('collectNodes: 全コミット A,B,C,D,S を表示',
+    ids.length === 5 && ids.indexOf('C') >= 0 && ids.indexOf('D') >= 0);
+
+  // 現在地 @ を A へ移しても、葉 B/D は可視ヘッドとして残る（commit→移動でコミットが消えない）。
+  store.working = 'A';
+  var r2 = Ggit_reachableIds(store);
+  _ok('reachable: @ を移動しても葉 B/D は残る', r2.A && r2.B && r2.C && r2.D);
+  var ids2 = Ggit_collectNodes(store).map(function (n) { return n.id; });
+  _ok('collectNodes: @ 移動後も全コミットを表示', ids2.indexOf('B') >= 0 && ids2.indexOf('D') >= 0);
+}
+
+/**
+ * Ggit_gcDisconnectedInStore / Ggit_countDisconnected（純粋関数）:
+ * 可視ヘッドの葉は孤立扱いにせず残し、掃除対象は「壊れ（復元不能）」のみ。現在地 @ は保護、
+ * 宙ぶらりんの参照を整理することを確認。
+ */
+function _test_gcDisconnected() {
+  var FULL = { type: 'full', data: 'x' };
+  var DELTA = { type: 'delta', data: 'd' };
+  var store = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, payload: FULL },      // 健全な根
+      B: { id: 'B', parent: 'A', parent2: null, payload: FULL },      // 現在地 @（健全）
+      LEAF: { id: 'LEAF', parent: 'A', parent2: null, payload: FULL }, // ブックマーク無しの葉＝可視ヘッド（残る）
+      BRK: { id: 'BRK', parent: 'GONE', parent2: null, payload: DELTA } // 壊れ（bookmark 参照・復元不能）
+    },
+    working: 'B', bookmarks: { broken: 'BRK' }
+  };
+  var before = Ggit_countDisconnected(store);
+  _ok('count: 孤立0・壊れ1（葉は孤立しない）', before.total === 1 && before.orphans === 0 && before.broken === 1);
+
+  var r = Ggit_gcDisconnectedInStore(store);
+  _ok('gc: 壊れ1件のみ削除', r.removed.length === 1 && r.orphans === 0 && r.broken === 1);
+  _ok('gc: 健全/現在地/可視ヘッドの葉は残る', !!store.objects.A && !!store.objects.B && !!store.objects.LEAF);
+  _ok('gc: 壊れは消える', !store.objects.BRK);
+  _ok('gc: 宙ぶらりん bookmark 除去', !store.bookmarks.hasOwnProperty('broken'));
+  _ok('gc: 現在地は健全', r.workingBroken === false);
+  _ok('gc後: 掃除対象ゼロ', Ggit_countDisconnected(store).total === 0);
+
+  // 現在地 @ 自体が壊れている場合は削除せず残し、workingBroken=true を報告する。
+  var s2 = {
+    version: 3,
+    objects: { W: { id: 'W', parent: 'GONE', parent2: null, payload: DELTA } },
+    working: 'W', bookmarks: {}
+  };
+  var r2 = Ggit_gcDisconnectedInStore(s2);
+  _ok('gc: 壊れた現在地は削除しない', !!s2.objects.W && r2.removed.length === 0);
+  _ok('gc: workingBroken=true を報告', r2.workingBroken === true);
+}
+
+/**
+ * Ggit_abandonInStore（純粋関数）: 葉から分岐元まで枝を刈り、共有点・現在地 @・ブックマーク先・
+ * スタッシュは残す。葉以外・現在地・スタッシュの破棄は拒否することを確認。
+ */
+function _test_abandon() {
+  var FULL = { type: 'full', data: 'x' };
+
+  // A → B → C（破棄対象の葉）、A → M（@・別枝）。C を破棄すると C と分岐専有の B が消え、共有点 A と @ は残る。
+  var store = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, payload: FULL },
+      C: { id: 'C', parent: 'B', parent2: null, payload: FULL },
+      M: { id: 'M', parent: 'A', parent2: null, payload: FULL }
+    },
+    working: 'M', bookmarks: {}
+  };
+  var r = Ggit_abandonInStore(store, 'C');
+  _ok('abandon: 葉 C と分岐専有の B を刈る', r.removed.length === 2 && !store.objects.C && !store.objects.B);
+  _ok('abandon: 分岐元 A（@ 側で共有）は残す', !!store.objects.A);
+  _ok('abandon: 現在地 @ M は残る', !!store.objects.M);
+
+  // ブックマークが枝の途中 B を指す場合、B で止まる（C のみ削除）。
+  var store2 = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, payload: FULL },
+      C: { id: 'C', parent: 'B', parent2: null, payload: FULL }
+    },
+    working: 'A', bookmarks: { keep: 'B' }
+  };
+  var r2 = Ggit_abandonInStore(store2, 'C');
+  _ok('abandon: ブックマーク先 B で止まる', r2.removed.length === 1 && !store2.objects.C && !!store2.objects.B);
+
+  // 後続のあるコミット・現在地 @・スタッシュは破棄不可（拒否してオブジェクトは残る）。
+  var store3 = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, payload: FULL },
+      S: { id: 'S', parent: 'A', parent2: null, payload: FULL, stash: true }
+    },
+    working: 'B', bookmarks: {}
+  };
+  var threwChild = false;
+  try { Ggit_abandonInStore(store3, 'A'); } catch (e) { threwChild = true; }
+  _ok('abandon: 後続のあるコミットは拒否', threwChild && !!store3.objects.A);
+  var threwWorking = false;
+  try { Ggit_abandonInStore(store3, 'B'); } catch (e) { threwWorking = true; }
+  _ok('abandon: 現在地 @ は拒否', threwWorking && !!store3.objects.B);
+  var threwStash = false;
+  try { Ggit_abandonInStore(store3, 'S'); } catch (e) { threwStash = true; }
+  _ok('abandon: スタッシュは拒否', threwStash && !!store3.objects.S);
+
+  // スタッシュだけが乗った葉は破棄でき、付随スタッシュも一緒に消える（実枝が無いので拒否しない）。
+  // A → B（葉。子はスタッシュ S のみ）、working=A。B を破棄すると B と S が消え、分岐元 A は残る。
+  var store4 = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, payload: FULL },
+      S: { id: 'S', parent: 'B', parent2: null, payload: FULL, stash: true }
+    },
+    working: 'A', bookmarks: {}
+  };
+  var r4 = Ggit_abandonInStore(store4, 'B');
+  _ok('abandon: スタッシュだけの葉 B は破棄できる', !store4.objects.B && r4.removed.length === 1);
+  _ok('abandon: 付随スタッシュ S も一緒に破棄', !store4.objects.S && r4.droppedStashes.length === 1);
+  _ok('abandon: 分岐元 A は残す', !!store4.objects.A);
 }
 
 /**
@@ -219,16 +403,36 @@ function _test_graphLines() {
 function _test_tabBodyEndIndex() {
   var res = {
     tabs: [
-      { tabId: 't.parent',
+      { tabProperties: { tabId: 't.parent' },
         documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 42 }] } },
         childTabs: [
-          { tabId: 't.child',
+          { tabProperties: { tabId: 't.child' },
             documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 7 }] } } }
         ] }
     ]
   };
   _ok('tabBodyEndIndex: トップ階層', Ggit_tabBodyEndIndex_(res, 't.parent') === 42);
   _ok('tabBodyEndIndex: 子タブ', Ggit_tabBodyEndIndex_(res, 't.child') === 7);
+}
+
+/**
+ * Ggit_firstNonStashAncestor_ が、スタッシュ（stash:true）を飛ばして直近の実コミットを返し、
+ * 連鎖が欠落していれば null を返すことを確認する（commit がスタッシュを親に取らない保証）。
+ */
+function _test_firstNonStashAncestor() {
+  var store = {
+    objects: {
+      A: { id: 'A', parent: null, parent2: null },
+      S: { id: 'S', parent: 'A', parent2: null, stash: true },
+      S2: { id: 'S2', parent: 'S', parent2: null, stash: true },
+      B: { id: 'B', parent: 'S', parent2: null }
+    }
+  };
+  _ok('firstNonStashAncestor: スタッシュを飛ばし実祖先A', Ggit_firstNonStashAncestor_(store, 'S') === 'A');
+  _ok('firstNonStashAncestor: 二段スタッシュもA', Ggit_firstNonStashAncestor_(store, 'S2') === 'A');
+  _ok('firstNonStashAncestor: 実コミットは自身', Ggit_firstNonStashAncestor_(store, 'B') === 'B');
+  _ok('firstNonStashAncestor: 連鎖欠落はnull',
+    Ggit_firstNonStashAncestor_({ objects: { X: { id: 'X', parent: 'GONE', stash: true } } }, 'X') === null);
 }
 
 function _test_lca() {

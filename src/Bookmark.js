@@ -79,6 +79,14 @@ function Ggit_goto(target) {
   if (!store.objects.hasOwnProperty(commitId)) {
     throw new Error('移動先が見つかりません: ' + target);
   }
+  // スタッシュは DAG の葉（退避ポケット）であり、その上に履歴を積めない。@ をスタッシュへ
+  // 乗せるとそこでコミットした実コミットがスタッシュを親に持ち、破棄時に孤立する。
+  // よってスタッシュへの移動は禁止し、内容が欲しければ pop、不要なら破棄へ誘導する。
+  if (store.objects[commitId].stash) {
+    throw new Error(
+      'スタッシュへは移動できません。スタッシュ一覧の「戻す(pop)」で内容を取り込むか、' +
+      '「破棄」してください。');
+  }
 
   var cur = Ggit_resolveWorking(doc, store);
   var targetSnap = Ggit_materialize(store, commitId);
