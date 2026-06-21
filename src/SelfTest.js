@@ -25,6 +25,8 @@ function _test_all() {
   _test_stashGuard();
   _test_firstNonStashAncestor();
   _test_tabBodyEndIndex();
+  _test_pickStore();
+  _test_backupChunkRoundTrip();
   Logger.log('--- self-test 完了 ---');
 }
 
@@ -492,4 +494,41 @@ function _test_stashGuard() {
 
   // 直前で作ったスタッシュと同一内容 → 作らない（重複防止が維持）。
   _ok('stash 同一スタッシュは重複させない', Ggit_stashIfNeeded(store, null, b, snapC, '退避') === false);
+}
+
+/**
+ * Ggit_pickStore の採用ロジック（純粋関数）。
+ * 巻き戻し検知＝backup.gen > tab.gen で backup を採用することを中心に各分岐を検証。
+ */
+function _test_pickStore() {
+  var tab = { version: 3, gen: 2, objects: { a: 1 }, bookmarks: {}, working: null };
+  var bk5 = { version: 3, gen: 5, objects: { a: 1, b: 1 }, bookmarks: {}, working: null };
+  var bk1 = { version: 3, gen: 1, objects: {}, bookmarks: {}, working: null };
+
+  _ok('pickStore: 巻き戻し検知で backup 採用', Ggit_pickStore(tab, bk5) === bk5);
+  _ok('pickStore: タブが新しければ tab 採用', Ggit_pickStore(tab, bk1) === tab);
+  _ok('pickStore: 同点はタブ優先', Ggit_pickStore({ gen: 3 }, { gen: 3 }).gen === 3 &&
+    Ggit_pickStore(tab, { gen: 2, objects: {}, bookmarks: {}, working: null }) === tab);
+  _ok('pickStore: backup 欠落で tab 採用', Ggit_pickStore(tab, null) === tab);
+  _ok('pickStore: tab 欠落で backup 採用', Ggit_pickStore(null, bk5) === bk5);
+  _ok('pickStore: 両方欠落で空ストア', Ggit_pickStore(null, null).gen === 0);
+}
+
+/**
+ * バックアップのチャンク分割→結合が原本一致すること（純粋関数）。
+ * gzip 圧縮の往復は GAS ランタイムが必要なため別途（_test_snapshotRoundTrip 等）に委ね、
+ * ここではチャンク化（Ggit_chunk）の分割/結合の正しさのみを検証する。
+ */
+function _test_backupChunkRoundTrip() {
+  var big = '';
+  for (var i = 0; i < 5000; i++) big += (i % 10);
+  var chunks = Ggit_chunk(big, 8000);
+  _ok('chunk: 分割数が想定どおり', chunks.length === 1);
+  _ok('chunk: 結合で原本一致(小)', chunks.join('') === big);
+
+  var chunks2 = Ggit_chunk(big, 700);
+  _ok('chunk: 複数分割', chunks2.length === Math.ceil(big.length / 700));
+  _ok('chunk: 各チャンクが上限以下', chunks2.every(function (c) { return c.length <= 700; }));
+  _ok('chunk: 結合で原本一致(分割)', chunks2.join('') === big);
+  _ok('chunk: 空文字は空配列', Ggit_chunk('', 700).length === 0);
 }

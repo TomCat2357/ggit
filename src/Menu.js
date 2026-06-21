@@ -24,6 +24,7 @@ function onOpen() {
     .addItem('ステータス', 'ggitUI_status')
     .addSeparator()
     .addItem('修復（壊れた履歴の復旧）', 'ggitUI_repair')
+    .addItem('整合性チェック / 復旧', 'ggitUI_reconcile')
     .addItem('About', 'ggitUI_about')
     .addToUi();
 }
@@ -468,6 +469,56 @@ function ggitUI_repair() {
   }
 }
 
+/**
+ * 整合性チェック / 復旧。
+ * `.vcs` タブと PropertiesService バックアップの世代（gen）を比較し、ネイティブ版復元による
+ * 巻き戻し（backup.gen > tab.gen）を検知したらバックアップからタブを即時ヒールする。
+ * バックアップ使用量（~500KB 上限への余裕）も表示する。
+ */
+function ggitUI_reconcile() {
+  var ui = DocumentApp.getUi();
+  try {
+    var doc = DocumentApp.getActiveDocument();
+    var tabStore = Ggit_tabStoreLoad(doc);
+    var backupStore = Ggit_backupLoad(doc);
+    var tabGen = tabStore ? (tabStore.gen || 0) : null;
+    var bkGen = backupStore ? (backupStore.gen || 0) : null;
+    var bytes = Ggit_backupBytes(doc);
+    var limit = 500 * 1024;
+
+    var lines = [];
+    lines.push('.vcs タブ世代 (gen): ' + (tabGen == null ? '（メタタブ無し）' : tabGen));
+    lines.push('バックアップ世代 (gen): ' + (bkGen == null ? '（バックアップ無し）' : bkGen));
+    lines.push('バックアップ使用量: 約 ' + Math.round(bytes / 1024) + ' KB / 上限 約 500 KB');
+
+    if (backupStore && (tabGen == null || bkGen > tabGen)) {
+      // 巻き戻し検知 → タブをバックアップからヒール（世代は据え置きで書き戻す）。
+      Ggit_setTabTextApi(doc.getId(), Ggit_reconcileTabId_(doc), JSON.stringify(backupStore));
+      lines.push('');
+      lines.push('⚠ ネイティブ版復元による巻き戻しを検出し、履歴を復旧しました' +
+        '（gen ' + (tabGen == null ? '無し' : tabGen) + ' → ' + bkGen + '）。');
+    } else {
+      lines.push('');
+      lines.push('整合しています（巻き戻しは検出されませんでした）。');
+    }
+    if (bytes > limit * 0.8) {
+      lines.push('');
+      lines.push('※ バックアップ使用量が上限に近づいています。大規模履歴では Drive サイドカーへの' +
+        '移行を検討してください（設計仕様書 §5.2 案C）。');
+    }
+    ui.alert('ggit 整合性チェック', lines.join('\n'), ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit 整合性チェック', 'エラー: ' + e.message, ui.ButtonSet.OK);
+  }
+}
+
+/** ヒール用にメタタブIDを得る（無ければ生成して返す）。 */
+function Ggit_reconcileTabId_(doc) {
+  var t = Ggit_metaTab(doc);
+  if (!t) t = Ggit_createTab(doc, GGIT_META_TITLE);
+  return t.getId();
+}
+
 function ggitUI_about() {
   var html =
     '<div style="font:13px/1.6 Roboto,Arial,sans-serif;padding:8px">' +
@@ -484,7 +535,9 @@ function ggitUI_about() {
     'commit は <code>@</code> を移しても消えず、<b>匿名ヘッド</b>として Log に残ります。不要な枝は葉の' +
     '<b>「破棄」</b>で削除できます。内容を復元できない<b>壊れたコミット</b>だけは表示されず、' +
     '<b>「掃除」</b>でまとめて削除できます（現在地 @ は残ります）。<br><br>' +
-    'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。<code>.vcs</code> タブは手動編集しないでください。<br>' +
+    'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存され、<b>PropertiesService にもバックアップ</b>されます' +
+    '（Google ネイティブ版復元で巻き戻っても「整合性チェック / 復旧」で履歴を復旧できます）。' +
+    '<code>.vcs</code> タブは手動編集しないでください。<br>' +
     'commit は本文の書式（文字・段落書式）も記録し、goto では書式ごと復元します。' +
     '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +
     '</div>';
