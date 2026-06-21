@@ -40,6 +40,70 @@ function Ggit_setTabText(tab, text) {
   tab.asDocumentTab().getBody().setText(text);
 }
 
+/**
+ * Docs API 経由でタブ本文をプレーンテキストで上書きする。
+ *
+ * `Ggit_setTabText`（DocumentApp）は、`Ggit_createTab` が `openById` で開いた
+ * 「2つ目のライブインスタンス」のタブに書くと、実行終了時のフラッシュ競合で
+ * 書き込みが失われることがある（新規タブ本文や `.vcs` 生成時に顕在化）。
+ * 本関数は DocumentApp を介さず Docs API で書くため、その競合を回避する。
+ *
+ * 既存本文を deleteContentRange で削除してから insertText する。本文末尾の改行は
+ * 削除できないため範囲は `endIndex - 1` まで。すべての Location/Range には対象タブを
+ * 指す `tabId` を付与する。
+ */
+function Ggit_setTabTextApi(docId, tabId, text) {
+  var docRes = Docs.Documents.get(docId, {
+    includeTabsContent: true,
+    fields: 'tabs(tabId,childTabs,documentTab(body(content(endIndex))))'
+  });
+  var endIndex = Ggit_tabBodyEndIndex_(docRes, tabId);
+
+  var requests = [];
+  // 既存本文（index 1 .. endIndex-1）を削除。末尾改行のみ（endIndex<=2）なら何もしない。
+  if (endIndex > 2) {
+    requests.push({
+      deleteContentRange: {
+        range: { startIndex: 1, endIndex: endIndex - 1, tabId: tabId }
+      }
+    });
+  }
+  // 新本文を本文先頭（index 1）へ挿入。
+  if (text && text.length) {
+    requests.push({
+      insertText: { location: { index: 1, tabId: tabId }, text: text }
+    });
+  }
+  if (requests.length) {
+    Docs.Documents.batchUpdate({ requests: requests }, docId);
+  }
+}
+
+/**
+ * Docs.Documents.get レスポンスから、指定タブの本文末尾 index を求める。
+ * タブ木（childTabs）を再帰的に辿って tabId 一致タブを探し、その
+ * documentTab.body.content 末尾要素の endIndex を返す。空本文時は 1 を返す。
+ */
+function Ggit_tabBodyEndIndex_(docRes, tabId) {
+  var found = null;
+  (function rec(tabs) {
+    if (!tabs) return;
+    for (var i = 0; i < tabs.length; i++) {
+      if (found) return;
+      if (tabs[i].tabId === tabId) { found = tabs[i]; return; }
+      rec(tabs[i].childTabs);
+    }
+  })(docRes.tabs);
+
+  if (!found || !found.documentTab || !found.documentTab.body ||
+      !found.documentTab.body.content) {
+    throw new Error('Docs API レスポンスから対象タブの本文を特定できませんでした: ' + tabId);
+  }
+  var content = found.documentTab.body.content;
+  var last = content[content.length - 1];
+  return (last && last.endIndex) ? last.endIndex : 1;
+}
+
 /** Docs API のドキュメントから全タブID（子タブ含む）を平坦に集める。 */
 function Ggit_docsTabIds(docId) {
   var docRes = Docs.Documents.get(docId, { includeTabsContent: false });

@@ -19,6 +19,7 @@ function _test_all() {
   _test_migrate();
   _test_graphLines();
   _test_stashGuard();
+  _test_tabBodyEndIndex();
   Logger.log('--- self-test 完了 ---');
 }
 
@@ -208,6 +209,26 @@ function _test_graphLines() {
   var ml = gline(merge);
   _ok('graph マージ: sprout 行 |\\ がある', ml.join('\n').indexOf('|\\') >= 0);
   _ok('graph マージ: collapse 行 |/ がある', ml.join('\n').indexOf('|/') >= 0);
+}
+
+/**
+ * Ggit_tabBodyEndIndex_ が Docs.Documents.get レスポンス（モック）から、
+ * トップ階層タブ・子タブそれぞれの本文末尾 endIndex を返すことを確認。
+ * これは `.vcs` を Docs API で安全に書き戻す Ggit_setTabTextApi の前提となる純粋ロジック。
+ */
+function _test_tabBodyEndIndex() {
+  var res = {
+    tabs: [
+      { tabId: 't.parent',
+        documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 42 }] } },
+        childTabs: [
+          { tabId: 't.child',
+            documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 7 }] } } }
+        ] }
+    ]
+  };
+  _ok('tabBodyEndIndex: トップ階層', Ggit_tabBodyEndIndex_(res, 't.parent') === 42);
+  _ok('tabBodyEndIndex: 子タブ', Ggit_tabBodyEndIndex_(res, 't.child') === 7);
 }
 
 function _test_lca() {

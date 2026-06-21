@@ -11,6 +11,8 @@
 function onOpen() {
   DocumentApp.getUi()
     .createMenu('ggit')
+    .addItem('Setup / 権限付与', 'ggitUI_setup')
+    .addSeparator()
     .addItem('Commit…', 'ggitUI_commit')
     .addItem('Log（グラフ）', 'ggitUI_log')
     .addItem('Diff…', 'ggitUI_diff')
@@ -92,6 +94,22 @@ function Ggit_uiListRefs() {
 }
 
 /* ===================== メニューハンドラ ===================== */
+
+function ggitUI_setup() {
+  var ui = DocumentApp.getUi();
+  try {
+    var info = Ggit_authorize();
+    ui.alert('ggit setup',
+      '初期化が完了しました。\n' +
+      'ドキュメント: ' + info.title + '\n' +
+      'タブ数: ' + info.tabCount + '\n\n' +
+      'これで Commit などの操作が利用できます。\n' +
+      '※ 権限承認の直後はGASの仕様により最初の操作がキャンセルされることがあります。' +
+      'その場合は同じ操作をもう一度実行してください。', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit setup', '初期化中にエラー: ' + e.message, ui.ButtonSet.OK);
+  }
+}
 
 function ggitUI_commit() {
   var ui = DocumentApp.getUi();

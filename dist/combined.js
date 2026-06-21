@@ -2699,6 +2699,8 @@ function Ggit_commitId(store, parent, timestamp, fullText) {
 function onOpen() {
   DocumentApp.getUi()
     .createMenu('ggit')
+    .addItem('Setup / 権限付与', 'ggitUI_setup')
+    .addSeparator()
     .addItem('Commit…', 'ggitUI_commit')
     .addItem('Log（グラフ）', 'ggitUI_log')
     .addItem('Diff…', 'ggitUI_diff')
@@ -2780,6 +2782,22 @@ function Ggit_uiListRefs() {
 }
 
 /* ===================== メニューハンドラ ===================== */
+
+function ggitUI_setup() {
+  var ui = DocumentApp.getUi();
+  try {
+    var info = Ggit_authorize();
+    ui.alert('ggit setup',
+      '初期化が完了しました。\n' +
+      'ドキュメント: ' + info.title + '\n' +
+      'タブ数: ' + info.tabCount + '\n\n' +
+      'これで Commit などの操作が利用できます。\n' +
+      '※ 権限承認の直後はGASの仕様により最初の操作がキャンセルされることがあります。' +
+      'その場合は同じ操作をもう一度実行してください。', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit setup', '初期化中にエラー: ' + e.message, ui.ButtonSet.OK);
+  }
+}
 
 function ggitUI_commit() {
   var ui = DocumentApp.getUi();
@@ -3313,6 +3331,7 @@ function _test_all() {
   _test_migrate();
   _test_graphLines();
   _test_stashGuard();
+  _test_tabBodyEndIndex();
   Logger.log('--- self-test 完了 ---');
 }
 
@@ -3502,6 +3521,26 @@ function _test_graphLines() {
   var ml = gline(merge);
   _ok('graph マージ: sprout 行 |\\ がある', ml.join('\n').indexOf('|\\') >= 0);
   _ok('graph マージ: collapse 行 |/ がある', ml.join('\n').indexOf('|/') >= 0);
+}
+
+/**
+ * Ggit_tabBodyEndIndex_ が Docs.Documents.get レスポンス（モック）から、
+ * トップ階層タブ・子タブそれぞれの本文末尾 endIndex を返すことを確認。
+ * これは `.vcs` を Docs API で安全に書き戻す Ggit_setTabTextApi の前提となる純粋ロジック。
+ */
+function _test_tabBodyEndIndex() {
+  var res = {
+    tabs: [
+      { tabId: 't.parent',
+        documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 42 }] } },
+        childTabs: [
+          { tabId: 't.child',
+            documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 7 }] } } }
+        ] }
+    ]
+  };
+  _ok('tabBodyEndIndex: トップ階層', Ggit_tabBodyEndIndex_(res, 't.parent') === 42);
+  _ok('tabBodyEndIndex: 子タブ', Ggit_tabBodyEndIndex_(res, 't.child') === 7);
 }
 
 function _test_lca() {
@@ -3976,11 +4015,29 @@ function Ggit_storeLoad(doc) {
 /** ストアをメタタブへ書き戻す（メタタブが無ければ生成）。 */
 function Ggit_storeSave(doc, store) {
   doc = doc || DocumentApp.getActiveDocument();
+  var docId = doc.getId();
   var t = Ggit_metaTab(doc);
   if (!t) {
     t = Ggit_createTab(doc, GGIT_META_TITLE);
   }
-  Ggit_setTabText(t, JSON.stringify(store));
+  // `.vcs` 初回生成時、Ggit_createTab は openById で開いた「2つ目のライブインスタンス」の
+  // タブを返す。そのタブへ DocumentApp で書くと、実行終了時のフラッシュ競合で書き込みが
+  // 消える（＝初回コミットでストアごと失われる）。Docs API 経由で書いて競合を回避する。
+  Ggit_setTabTextApi(docId, t.getId(), JSON.stringify(store));
+}
+
+/**
+ * 認可を確実に発火させるための no-op 認可関数（Setup メニューから呼ぶ）。
+ *
+ * onOpen は AuthMode.NONE で動くため、初回の本格操作（commit 等）で認可ダイアログが
+ * 出ると、その関数は再実行されずに中断される。本関数を先に一度実行して認可を済ませることで、
+ * 最初の commit が認可中断で消える事象を避ける。ドキュメント名とタブ数を返す。
+ */
+function Ggit_authorize() {
+  var doc = DocumentApp.getActiveDocument();
+  var tabs = Ggit_allTabs(doc); // documents スコープに触れる読み取り
+  try { Session.getActiveUser().getEmail(); } catch (_) {}
+  return { title: doc.getName(), tabCount: tabs.length };
 }
 
 /**
@@ -4091,6 +4148,70 @@ function Ggit_tabText(tab) {
 /** タブ本文をプレーンテキストで上書き。 */
 function Ggit_setTabText(tab, text) {
   tab.asDocumentTab().getBody().setText(text);
+}
+
+/**
+ * Docs API 経由でタブ本文をプレーンテキストで上書きする。
+ *
+ * `Ggit_setTabText`（DocumentApp）は、`Ggit_createTab` が `openById` で開いた
+ * 「2つ目のライブインスタンス」のタブに書くと、実行終了時のフラッシュ競合で
+ * 書き込みが失われることがある（新規タブ本文や `.vcs` 生成時に顕在化）。
+ * 本関数は DocumentApp を介さず Docs API で書くため、その競合を回避する。
+ *
+ * 既存本文を deleteContentRange で削除してから insertText する。本文末尾の改行は
+ * 削除できないため範囲は `endIndex - 1` まで。すべての Location/Range には対象タブを
+ * 指す `tabId` を付与する。
+ */
+function Ggit_setTabTextApi(docId, tabId, text) {
+  var docRes = Docs.Documents.get(docId, {
+    includeTabsContent: true,
+    fields: 'tabs(tabId,childTabs,documentTab(body(content(endIndex))))'
+  });
+  var endIndex = Ggit_tabBodyEndIndex_(docRes, tabId);
+
+  var requests = [];
+  // 既存本文（index 1 .. endIndex-1）を削除。末尾改行のみ（endIndex<=2）なら何もしない。
+  if (endIndex > 2) {
+    requests.push({
+      deleteContentRange: {
+        range: { startIndex: 1, endIndex: endIndex - 1, tabId: tabId }
+      }
+    });
+  }
+  // 新本文を本文先頭（index 1）へ挿入。
+  if (text && text.length) {
+    requests.push({
+      insertText: { location: { index: 1, tabId: tabId }, text: text }
+    });
+  }
+  if (requests.length) {
+    Docs.Documents.batchUpdate({ requests: requests }, docId);
+  }
+}
+
+/**
+ * Docs.Documents.get レスポンスから、指定タブの本文末尾 index を求める。
+ * タブ木（childTabs）を再帰的に辿って tabId 一致タブを探し、その
+ * documentTab.body.content 末尾要素の endIndex を返す。空本文時は 1 を返す。
+ */
+function Ggit_tabBodyEndIndex_(docRes, tabId) {
+  var found = null;
+  (function rec(tabs) {
+    if (!tabs) return;
+    for (var i = 0; i < tabs.length; i++) {
+      if (found) return;
+      if (tabs[i].tabId === tabId) { found = tabs[i]; return; }
+      rec(tabs[i].childTabs);
+    }
+  })(docRes.tabs);
+
+  if (!found || !found.documentTab || !found.documentTab.body ||
+      !found.documentTab.body.content) {
+    throw new Error('Docs API レスポンスから対象タブの本文を特定できませんでした: ' + tabId);
+  }
+  var content = found.documentTab.body.content;
+  var last = content[content.length - 1];
+  return (last && last.endIndex) ? last.endIndex : 1;
 }
 
 /** Docs API のドキュメントから全タブID（子タブ含む）を平坦に集める。 */
