@@ -1,0 +1,2 @@
+# テキストファイルはすべて LF に正規化（CRLF 混入を防止）
+* text=auto eol=lf

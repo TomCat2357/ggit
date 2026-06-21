@@ -2,17 +2,53 @@
  * Commit.js — commit / log。
  *
  * 設計仕様書 §6: commit はアクティブタブ本文をスナップショット化し、
- * 親＝当該タブの HEAD として新コミットを記録、ブランチ HEAD を更新する。
+ * 親＝現在地 working として新コミットを記録、working（現在地 @）を新コミットへ前進させる。
+ * Jujutsu と同様、ブックマークは commit では動かさない（明示操作でのみ移動）。
  */
 
-/** コミット作者（取得できなければ 'unknown'）。 */
-function Ggit_author() {
+/**
+ * コミット作者の表示名（ユーザー名）。People API（要 userinfo.profile スコープ）で
+ * 自分のプロフィール名を引く。取得できなければ空文字。
+ * 一次名（metadata.primary）を優先し、無ければ先頭の displayName を使う。
+ */
+function Ggit_authorName_() {
   try {
-    var e = Session.getActiveUser().getEmail();
-    return e || 'unknown';
+    var resp = People.People.get('people/me', { personFields: 'names' });
+    var names = (resp && resp.names) || [];
+    for (var i = 0; i < names.length; i++) {
+      if (names[i].metadata && names[i].metadata.primary && names[i].displayName) {
+        return names[i].displayName;
+      }
+    }
+    if (names.length && names[0].displayName) return names[0].displayName;
+  } catch (_) {}
+  return '';
+}
+
+/** コミット作者のメールアドレス（要 userinfo.email スコープ）。取得できなければ空文字。 */
+function Ggit_authorEmail_() {
+  try {
+    return Session.getActiveUser().getEmail() || '';
   } catch (_) {
-    return 'unknown';
+    return '';
   }
+}
+
+/**
+ * コミット作者を git 形式の識別子「ユーザー名 <メールアドレス>」で返す。
+ *  - 名前・メールが揃う … "名前 <メール>"
+ *  - メールのみ取得     … "メール"
+ *  - 名前のみ取得       … "名前"
+ *  - どちらも取れない   … 'unknown'
+ * 旧コミット（author が生メールのみ）とも互換: author は単一文字列のまま。
+ */
+function Ggit_author() {
+  var name = Ggit_authorName_();
+  var email = Ggit_authorEmail_();
+  if (name && email) return name + ' <' + email + '>';
+  if (email) return email;
+  if (name) return name;
+  return 'unknown';
 }
 
 /** ISO8601（タイムゾーンオフセット付き）のタイムスタンプ。 */
@@ -27,7 +63,6 @@ function Ggit_timestamp() {
  */
 function Ggit_commit(message) {
   var doc = DocumentApp.getActiveDocument();
-  Ggit_ensureBackupFresh_(doc); // 保留中の非同期バックアップを先に収束（dirty ガード）
   var tab = doc.getActiveTab();
   var tabId = tab.getId();
 
@@ -38,20 +73,27 @@ function Ggit_commit(message) {
 
   var snap = Ggit_serializeTab(tab); // テキスト＋書式の構造化スナップショット
   var store = Ggit_storeLoad(doc);
-  var br = store.branches[tabId];
-  var parent = br ? br.head : null;
+
+  // 親＝現在地 working。初回（未確立）は parent=null。
+  var parent = Ggit_resolveWorking(doc, store);
+
+  // 防御: 現在地が（移行データ等で）スタッシュを指している場合、スタッシュは履歴の親に
+  // なってはならない。実在する直近の非スタッシュ祖先へ繋ぎ直す（無ければ初回扱い null）。
+  // Ggit_goto はスタッシュへの移動を禁止しているため通常はここを通らない。
+  if (parent && store.objects[parent] && store.objects[parent].stash) {
+    parent = Ggit_firstNonStashAncestor_(store, parent);
+  }
 
   if (parent && Ggit_materialize(store, parent) === snap) {
     throw new Error('変更がありません（前回コミットと同一の内容です）。');
   }
 
   var ts = Ggit_timestamp();
-  var id = Ggit_commitId(store, tabId, parent, ts, snap);
+  var id = Ggit_commitId(store, parent, ts, snap);
   var payload = Ggit_makePayload(store, parent, snap);
 
   store.objects[id] = {
     id: id,
-    branch: tabId,
     parent: parent,
     parent2: null,
     message: message,
@@ -59,18 +101,32 @@ function Ggit_commit(message) {
     timestamp: ts,
     payload: payload
   };
-  store.branches[tabId] = { head: id, name: tab.getTitle() };
+  store.working = id; // 現在地 @ のみ前進（ブックマークは動かさない＝jj）
 
-  Ggit_storeSave(doc, store, [id]);
+  Ggit_storeSave(doc, store);
   return id;
 }
 
-/** 指定タブ（省略時はアクティブタブ）の HEAD から親方向に辿ったコミット配列。 */
-function Ggit_logChain(store, tabId) {
-  var br = store.branches[tabId];
-  if (!br) return [];
+/**
+ * id（自身を含む）から親方向へ辿り、最初に現れる「実在する非スタッシュ」コミットIDを返す。
+ * スタッシュ（stash:true）は飛ばす。連鎖が途中で欠落（参照先が無い）したら null を返す。
+ * commit がスタッシュを親に取ってしまわないための繋ぎ直し先を求めるのに使う。
+ */
+function Ggit_firstNonStashAncestor_(store, id) {
+  var cur = id;
+  while (cur) {
+    var o = store.objects[cur];
+    if (!o) return null;       // 連鎖が壊れている（参照先欠落）
+    if (!o.stash) return cur;  // 実コミットに到達
+    cur = o.parent;
+  }
+  return null;
+}
+
+/** 指定コミットIDから親方向に辿ったコミット配列（フラットログ・status 用）。 */
+function Ggit_logChain(store, startId) {
   var out = [];
-  var id = br.head;
+  var id = startId || null;
   while (id) {
     var o = store.objects[id];
     if (!o) break;

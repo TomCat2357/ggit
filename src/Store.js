@@ -3,39 +3,46 @@
  *
  * 配置は設計仕様書 §5.2 の「案A」を基本としつつ、Google ネイティブ版復元
  * （ファイル > 変更履歴 > この版に戻す）への耐性のため PropertiesService
- * （DocumentProperties）への外部バックアップを併設する「ハイブリッド」方式を採る。
+ * （DocumentProperties）への外部バックアップを併設する「ハイブリッド」方式を採る（§5.4）。
  *
- * 背景: ネイティブ版復元はドキュメント全体を巻き戻すため、`.vcs` タブもろとも
- * メタストアが過去へ戻り、それ以降の履歴が失われる。DocumentProperties は
- * ドキュメント本文ではないため版復元の影響を受けない。これを「正」として保持し、
- * 単調増加の世代カウンタ `gen` で巻き戻しを検知して履歴を復旧する（設計仕様書 §5.2）。
+ * 背景: ネイティブ版復元はドキュメント全体を巻き戻すため、`.vcs` タブもろともメタストアが
+ * 過去へ戻り、それ以降の履歴が失われる。DocumentProperties はドキュメント本文ではないため
+ * 版復元の影響を受けない。これを「正」として保持し、単調増加の世代カウンタ `gen` で巻き戻しを
+ * 検知して履歴を復旧する。
+ *
+ * ストア構造（version 3: Jujutsu 流ブックマークモデル）:
+ * {
+ *   "version": 3,
+ *   "gen":       0,                     // 単調増加の世代カウンタ（保存ごとに +1）。巻き戻し検知用
+ *   "objects":   { <commitId>: <commitObject>, ... },  // 通常コミット＋スタッシュ（stash:true）
+ *   "bookmarks": { <bookmarkName>: <commitId>, ... },  // 手動の名前付きポインタ（commitで自動前進しない）
+ *   "working":   <commitId>            // 現在地 @（匿名ヘッド）。未確立なら null
+ * }
+ * jj と同様、commit は working（現在地）だけを前進させ、ブックマークは明示操作でのみ動かす。
+ * スタッシュは DAG の外ではなく objects 内の stash:true 付きコミットとして表現する（§Stash.js）。
+ *
+ * 旧スキーマは読み込み時に Ggit_migrateStore で自動移行する:
+ *  - version 1（branches が <tabId>:{head,name}、head 概念なし。「タブ＝ブランチ」）
+ *  - version 2（branches が <branchName>:<headCommitId>、head=現在ブランチ、stashes[] 配列）
  *
  * 差分・追記永続化:
- *   `store.objects` は内容ハッシュをキーにした不変オブジェクトで、1 操作で増えるのは
- *   高々 1 件、変わるのは branches(HEAD) と gen のみ。そこで毎回の全書き直しを避け、
+ *   objects は内容ハッシュをキーにした不変オブジェクトで、1 操作で増えるのは高々 1 件。
+ *   そこで毎回の全書き直しを避け、
  *   - `.vcs` タブ … 追記型ログ（JSONL）。通常保存は末尾へ 1 行追記（O(新規)）。
  *   - Properties … オブジェクト単位の KV（ggit.o.<id>）＋小さな meta。差分追記のみ。
- *   とする。古い meta 行が溜まったら「圧縮 / 清書」で全清書（コンパクション）する。
+ *   とする。古い meta 行が溜まったら／オブジェクト削除（GC）時は全清書へ切替える。
  *
  * 非同期バックアップ:
- *   Properties への書き込みは時間ベース一回限りトリガ（Ggit_backupFlush）へ後送りし、
- *   その間は dirty フラグを立てる。次の変更操作は冒頭で Ggit_ensureBackupFresh_ により
- *   保留中のバックアップを同期収束させてから続行する（dirty ガード）。
- *
- * ストア構造（メモリ上）:
- * {
- *   "version": 1,
- *   "gen":      0,            // 単調増加の世代カウンタ（保存ごとに +1）
- *   "objects":  { <commitId>: <commitObject>, ... },
- *   "branches": { <tabId>: { "head": <commitId>, "name": <string> }, ... }
- * }
+ *   Properties への書き込みは時間ベース一回限りトリガ（Ggit_backupFlush）へ後送りし、その間は
+ *   dirty フラグを立てる。次の保存は冒頭で Ggit_ensureBackupFresh_ により保留中バックアップを
+ *   同期収束させてから続行する（dirty ガード）。差分追記なので収束も O(新規) で軽い。
  */
 
 var GGIT_META_TITLE = '.vcs';
 
-/** PropertiesService キー（差分追記型）。 */
+/** PropertiesService バックアップ（差分追記型）のキー。 */
 var GGIT_OBJ_PREFIX = 'ggit.o.';        // ggit.o.<id>.n（チャンク数）/ ggit.o.<id>.<i>（チャンク）
-var GGIT_META_KEY = 'ggit.meta';        // {version,gen,branches}（小・毎回上書き）
+var GGIT_META_KEY = 'ggit.meta';        // {version,gen,bookmarks,working}（小・毎回上書き）
 var GGIT_DIRTY_KEY = 'ggit.dirty';      // 非同期バックアップ未完了フラグ（保存待ち gen）
 var GGIT_DOCID_KEY = 'ggit.docid';      // 時間トリガから openById するための docId
 var GGIT_ERR_KEY = 'ggit.bk_err';       // 直近のバックアップ失敗理由（非同期のため後で提示）
@@ -63,24 +70,23 @@ function Ggit_metaTab(doc) {
 
 /** 空のストアを生成。 */
 function Ggit_emptyStore() {
-  return { version: 1, gen: 0, objects: {}, branches: {} };
+  return { version: 3, gen: 0, objects: {}, bookmarks: {}, working: null };
 }
 
-/** ストアオブジェクトの欠損フィールドを既定値で補う（タブ/バックアップ共通）。 */
-function Ggit_normStore(s) {
-  s.version = s.version || 1;
-  s.gen = s.gen || 0;
-  s.objects = s.objects || {};
-  s.branches = s.branches || {};
-  return s;
+/** オブジェクトマップから id 集合 {id:true} を作る。 */
+function Ggit_idSet_(objects) {
+  var out = {};
+  for (var id in objects) { if (objects.hasOwnProperty(id)) out[id] = true; }
+  return out;
 }
 
 /**
- * メタタブと PropertiesService バックアップの両方を読み、世代の新しい方を採用する。
+ * メタタブと PropertiesService バックアップの両方を読み、世代（gen）の新しい方を採用する。
  *
- * ネイティブ版復元で `.vcs` タブが巻き戻された場合（backup.gen > tab.gen）は
- * バックアップを正として返し、履歴喪失を防ぐ。タブへの書き戻し（ヒール）は副作用を
- * 避けるため行わず、次回 `Ggit_storeSave`／`Ggit_convergeStores_` で反映される。
+ * ネイティブ版復元で `.vcs` タブが巻き戻された場合（backup.gen > tab.gen）はバックアップを
+ * 正として返し、履歴喪失を防ぐ。読み取り経路では副作用（Docs API 書き込み）を避けるためタブへの
+ * 書き戻し（ヒール）は行わず、次回 Ggit_storeSave で自動反映される（遅延ヒール）。復元直後に
+ * 確実に整合させたい場合はメニュー「整合性チェック / 復旧」で即時ヒールできる。
  */
 function Ggit_storeLoad(doc) {
   doc = doc || DocumentApp.getActiveDocument();
@@ -102,8 +108,8 @@ function Ggit_tabStoreLoad(doc) {
  * `.vcs` 本文（生文字列）をストアへ解析する。
  *  - 1行目が ggit-log ヘッダなら新形式（JSONL ログ）としてリプレイ。
  *  - そうでなければ旧形式（単一 JSON ストア）として読む（後方互換）。
- * パース不能行はスキップする（版復元によるログ末尾切れ等への防御）。
- * 解析結果には保存時の判断用に非永続フィールド __logok / __metaSeen を付与する。
+ * パース不能行はスキップする（版復元によるログ末尾切れ等への防御）。解析結果には保存時の
+ * 判断用に非永続フィールド __logok / __metaSeen / __persistedIds を付与する。
  */
 function Ggit_logParse_(raw) {
   var lines = raw.split('\n');
@@ -116,9 +122,11 @@ function Ggit_logParse_(raw) {
     try { s = JSON.parse(raw); } catch (e2) {
       throw new Error('.vcs メタタブのJSON解析に失敗しました（手動編集の可能性）: ' + e2.message);
     }
-    s = Ggit_normStore(s);
-    s.__logok = false;  // 旧形式 → 次回保存で清書移行
+    s.objects = s.objects || {};
+    s = Ggit_migrateStore(s);
+    s.__logok = false;            // 旧形式 → 次回保存で清書移行
     s.__metaSeen = 0;
+    s.__persistedIds = Ggit_idSet_(s.objects);
     return s;
   }
 
@@ -135,48 +143,50 @@ function Ggit_logParse_(raw) {
     } else if (rec.m) {
       store.version = rec.version || store.version;
       store.gen = rec.gen || 0;
-      store.branches = rec.branches || {};
+      store.bookmarks = rec.bookmarks || {};
+      store.working = (rec.working !== undefined) ? rec.working : null;
       metaSeen++;
     }
   }
-  store = Ggit_normStore(store);
+  store = Ggit_migrateStore(store);
   store.__logok = true;
   store.__metaSeen = metaSeen;
+  store.__persistedIds = Ggit_idSet_(store.objects);
   return store;
 }
 
 /**
  * タブストアとバックアップストアから採用するストアを決定する（純粋関数）。
- *  - 両方 null      → 空ストア。
- *  - 片方のみ存在    → 在る方。
- *  - 両方存在        → gen の大きい方（同点はタブを優先）。
+ *  - 両方 null   → 空ストア。
+ *  - 片方のみ    → 在る方。
+ *  - 両方存在    → gen の大きい方（同点はタブを優先）。
  * backup.gen > tab.gen はネイティブ版復元によるタブ巻き戻しのシグナル。
  */
 function Ggit_pickStore(tabStore, backupStore) {
   if (!tabStore && !backupStore) return Ggit_emptyStore();
   if (!backupStore) return tabStore;
   if (!tabStore) return backupStore;
-  return (backupStore.gen > tabStore.gen) ? backupStore : tabStore;
+  return ((backupStore.gen || 0) > (tabStore.gen || 0)) ? backupStore : tabStore;
 }
 
 /**
  * ストアをメタタブへ保存し、PropertiesService バックアップは非同期へ後送りする。
- * 世代カウンタを +1 し、`.vcs` タブへ追記（または清書）した後、dirty フラグを立てて
- * バックアップ用トリガを予約する。Properties への書き込みは Ggit_backupFlush で行う。
+ * 冒頭で dirty ガード（保留中の差分バックアップを同期収束）を通し、世代カウンタを +1 して
+ * `.vcs` タブへ追記（または清書）した後、dirty フラグを立ててバックアップ用トリガを予約する。
+ * Properties への書き込みは Ggit_backupFlush（時間トリガ）が担う。
  *
- * @param newObjectIds この保存で新たに追加されたオブジェクトIDの配列（追記対象）。
- *        省略/未指定の場合は安全側で全清書する。branch のように新規オブジェクトが
- *        無い保存では空配列 [] を渡す（meta 行のみ追記）。
+ * 追記対象の新規オブジェクトは、読み込み時に控えた __persistedIds との差分から内部で判定する
+ * （呼び出し側の変更は不要）。オブジェクト削除（GC）や旧形式・コンパクション時は全清書する。
  * 戻り値: { gen, warning }（warning は常に null。バックアップは非同期のため）。
  */
-function Ggit_storeSave(doc, store, newObjectIds) {
+function Ggit_storeSave(doc, store) {
   doc = doc || DocumentApp.getActiveDocument();
+  Ggit_ensureBackupFresh_(doc); // dirty ガード（保留中の差分バックアップを先に収束）
   var docId = doc.getId();
-  store.version = store.version || 1;
   store.gen = (store.gen || 0) + 1;
 
   // `.vcs` タブを一次の永続先として同期書き込み（追記 or 清書）。
-  Ggit_tabPersist_(doc, docId, store, newObjectIds);
+  Ggit_tabPersist_(doc, docId, store);
 
   // Properties バックアップは非同期へ: docId 記録・dirty 化・トリガ予約。
   try {
@@ -195,34 +205,47 @@ function Ggit_storeSave(doc, store, newObjectIds) {
 
 /**
  * `.vcs` タブへの永続化（追記 or 全清書）。
- * 追記条件: メタタブが既に新形式ログで、新規IDが指定され、溜まった meta 行が閾値未満。
- * それ以外（新規ドキュメント・旧形式・巻き戻し採用・コンパクション）は全清書する。
+ * 追記条件: メタタブが既に新形式ログで、読込時の永続集合からオブジェクト削除が無く、
+ * 溜まった meta 行が閾値未満。それ以外（新規・旧形式・巻き戻し採用・削除・コンパクション）は全清書。
  */
-function Ggit_tabPersist_(doc, docId, store, newObjectIds) {
+function Ggit_tabPersist_(doc, docId, store) {
   var t = Ggit_metaTab(doc);
-  var canAppend = !!t && store.__logok === true && newObjectIds != null &&
+  var persisted = store.__persistedIds;
+  var added = [];
+  var removed = false;
+  if (persisted) {
+    for (var id in store.objects) {
+      if (store.objects.hasOwnProperty(id) && !persisted[id]) added.push(id);
+    }
+    for (var pid in persisted) {
+      if (persisted.hasOwnProperty(pid) && !store.objects.hasOwnProperty(pid)) { removed = true; break; }
+    }
+  }
+  var canAppend = !!t && store.__logok === true && !!persisted && !removed &&
     (store.__metaSeen || 0) < GGIT_COMPACT_INTERVAL;
   if (!t) t = Ggit_createTab(doc, GGIT_META_TITLE);
 
   if (canAppend) {
-    Ggit_appendTabTextApi(docId, t.getId(), Ggit_logAppend_(store, newObjectIds));
+    Ggit_appendTabTextApi(docId, t.getId(), Ggit_logAppend_(store, added));
     store.__metaSeen = (store.__metaSeen || 0) + 1;
   } else {
     Ggit_setTabTextApi(docId, t.getId(), Ggit_logRewrite_(store));
     store.__logok = true;
     store.__metaSeen = 1;
   }
+  store.__persistedIds = Ggit_idSet_(store.objects);
 }
 
 /** ログのヘッダ行。 */
 function Ggit_logHeaderLine_(store) {
-  return JSON.stringify({ h: GGIT_LOG_HEADER, version: store.version || 1 });
+  return JSON.stringify({ h: GGIT_LOG_HEADER, version: store.version || 3 });
 }
 
-/** ログの meta 行（最新の version/gen/branches）。 */
+/** ログの meta 行（最新の version/gen/bookmarks/working）。 */
 function Ggit_logMetaLine_(store) {
   return JSON.stringify({
-    m: 1, version: store.version || 1, gen: store.gen || 0, branches: store.branches || {}
+    m: 1, version: store.version || 3, gen: store.gen || 0,
+    bookmarks: store.bookmarks || {}, working: store.working || null
   });
 }
 
@@ -271,9 +294,7 @@ function Ggit_backupSave(doc, store) {
       Ggit_propPutObj_(map, id, store.objects[id]);
       if (++pending >= GGIT_BK_BATCH) { props.setProperties(map); map = {}; pending = 0; }
     }
-    map[GGIT_META_KEY] = JSON.stringify({
-      version: store.version || 1, gen: store.gen || 0, branches: store.branches || {}
-    });
+    map[GGIT_META_KEY] = Ggit_backupMetaStr_(store);
     props.setProperties(map);
 
     Ggit_backupPurgeLegacy_(props); // 旧 ggit.bk.* の残骸を移行掃除
@@ -287,6 +308,14 @@ function Ggit_backupSave(doc, store) {
   }
 }
 
+/** Properties の meta 文字列（version/gen/bookmarks/working）。 */
+function Ggit_backupMetaStr_(store) {
+  return JSON.stringify({
+    version: store.version || 3, gen: store.gen || 0,
+    bookmarks: store.bookmarks || {}, working: store.working || null
+  });
+}
+
 /** DocumentProperties のバックアップからストアを復元する（無ければ null）。新旧両対応。 */
 function Ggit_backupLoad(doc) {
   try {
@@ -297,16 +326,17 @@ function Ggit_backupLoad(doc) {
 
     var meta = JSON.parse(metaRaw);
     var store = Ggit_emptyStore();
-    store.version = meta.version || 1;
+    store.version = meta.version || 3;
     store.gen = meta.gen || 0;
-    store.branches = meta.branches || {};
+    store.bookmarks = meta.bookmarks || {};
+    store.working = (meta.working !== undefined) ? meta.working : null;
     var ids = Ggit_backupObjIds_(props);
     for (var id in ids) {
       if (!ids.hasOwnProperty(id)) continue;
       var obj = Ggit_propGetObj_(props, id);
       if (obj) store.objects[id] = obj;
     }
-    return Ggit_normStore(store);
+    return Ggit_migrateStore(store);
   } catch (e) {
     Logger.log('ggit backup 読込失敗: ' + e.message);
     return null;
@@ -325,7 +355,9 @@ function Ggit_backupLoadLegacy_(props) {
     if (c == null) return null;
     parts.push(c);
   }
-  return Ggit_normStore(JSON.parse(Ggit_gunzipB64(parts.join(''))));
+  var s = JSON.parse(Ggit_gunzipB64(parts.join('')));
+  s.objects = s.objects || {};
+  return Ggit_migrateStore(s);
 }
 
 /** バックアップ済みオブジェクトIDの集合（ggit.o.<id>.n キーから抽出）。 */
@@ -505,9 +537,9 @@ function Ggit_convergeStores_(doc) {
 }
 
 /**
- * dirty（保留中バックアップ）なら、変更操作に先立って同期的に収束させる。
- * 各変更操作（commit / branch / merge / restore）の冒頭で呼ぶ dirty ガード。
- * バックグラウンドが処理中でロックが取れない場合は、その処理が収束を担うため続行する。
+ * dirty（保留中バックアップ）なら、保存に先立って同期的に収束させる。
+ * Ggit_storeSave 冒頭で呼ぶ dirty ガード。バックグラウンドが処理中でロックが取れない場合は、
+ * その処理が収束を担うため続行する。
  */
 function Ggit_ensureBackupFresh_(doc) {
   if (!Ggit_isDirty_()) return;
@@ -570,25 +602,104 @@ function Ggit_backupRewrite_(store) {
     Ggit_propPutObj_(map, id, store.objects[id]);
     if (++pending >= GGIT_BK_BATCH) { props.setProperties(map); map = {}; pending = 0; }
   }
-  map[GGIT_META_KEY] = JSON.stringify({
-    version: store.version || 1, gen: store.gen || 0, branches: store.branches || {}
-  });
+  map[GGIT_META_KEY] = Ggit_backupMetaStr_(store);
   props.setProperties(map);
   props.deleteProperty(GGIT_ERR_KEY);
 }
 
+/** `.vcs` メタタブが存在するか（＝初期化済みか）。 */
+function Ggit_isInitialized(doc) {
+  return !!Ggit_metaTab(doc || DocumentApp.getActiveDocument());
+}
+
 /**
- * 認可を確実に発火させるための no-op 認可関数（Setup メニューから呼ぶ）。
+ * 初期化（権限付与）— これ「だけ」で初回セットアップを完結させる。
  *
- * onOpen は AuthMode.NONE で動くため、初回の本格操作（commit 等）で認可ダイアログが
- * 出ると、その関数は再実行されずに中断される。本関数を先に一度実行して認可を済ませることで、
- * 最初の commit が認可中断で消える事象を避ける。ドキュメント名とタブ数を返す。
+ * onOpen は AuthMode.NONE で動くため、初回の本格操作（commit 等）で認可ダイアログが出ると、
+ * その関数は再実行されずに中断される。そこで初回はまず本関数で (1) 必要スコープに触れて認可を
+ * 済ませ、(2) 空ストアの `.vcs` メタタブを作るところまでやって終わる。以降、commit などは
+ * 「`.vcs` を新規生成する」副作用を持たずに済む（＝初回コミットでの生成競合・認可中断が起きない）。
+ *
+ * 既に初期化済み（`.vcs` あり）なら作成はスキップする。戻り値: { created, title, tabCount }。
  */
-function Ggit_authorize() {
+function Ggit_setup() {
   var doc = DocumentApp.getActiveDocument();
-  var tabs = Ggit_allTabs(doc); // documents スコープに触れる読み取り
-  try { Session.getActiveUser().getEmail(); } catch (_) {}
-  // script.scriptapp スコープ（トリガ作成）も初回認可に含める。
-  try { ScriptApp.getProjectTriggers(); } catch (_) {}
-  return { title: doc.getName(), tabCount: tabs.length };
+  try { Session.getActiveUser().getEmail(); } catch (_) {}                 // userinfo.email スコープに触れる
+  try { People.People.get('people/me', { personFields: 'names' }); } catch (_) {} // userinfo.profile（People）に触れる
+  try { ScriptApp.getProjectTriggers(); } catch (_) {}                     // script.scriptapp（非同期バックアップのトリガ）に触れる
+  var existed = Ggit_isInitialized(doc);
+  if (!existed) {
+    Ggit_storeSave(doc, Ggit_emptyStore()); // `.vcs` を空ストアで生成（Docs API 書き込み）
+  }
+  var tabs = Ggit_allTabs(doc);
+  return { created: !existed, title: doc.getName(), tabCount: tabs.length };
+}
+
+/**
+ * 旧スキーマを最新（version 3: Jujutsu 流ブックマークモデル）へ移行する。純粋関数。
+ *  - version 1（branches が <tabId>:{head,name}）→ まず branches を <branchName>:<headCommitId> へ正規化。
+ *  - version 2（branches/head/stashes[]）→ branches を bookmarks へ、head を working（コミットID）へ、
+ *    stashes[] 各要素を stash:true のコミットへ変換して objects に投入する。
+ * 既に version 3 のストアはそのまま返す（working 欠落時のみ補う）。
+ */
+function Ggit_migrateStore(s) {
+  if (s.version >= 3) {
+    if (s.working === undefined) s.working = null;
+    s.bookmarks = s.bookmarks || {};
+    if (s.gen === undefined) s.gen = 0;
+    return s;
+  }
+
+  // --- v1 → v2 相当: branches を <branchName>:<headCommitId> へ正規化 ---
+  var branches = {};
+  for (var k in s.branches) {
+    if (!s.branches.hasOwnProperty(k)) continue;
+    var v = s.branches[k];
+    if (v && typeof v === 'object' && v.head !== undefined) {
+      var name = v.name || k;                       // タブ名（無ければ tabId）を採用
+      var base = name, i = 2;
+      while (branches.hasOwnProperty(name)) { name = base + '-' + i; i++; } // 同名は連番で一意化
+      branches[name] = v.head;
+    } else {
+      branches[k] = v;                              // 既に文字列 HEAD
+    }
+  }
+
+  // --- v2 → v3: branches→bookmarks、head→working、stashes[]→stash コミット ---
+  s.bookmarks = branches;
+  s.working = (s.head && branches.hasOwnProperty(s.head)) ? branches[s.head] : null;
+
+  var stashes = s.stashes || [];
+  for (var j = 0; j < stashes.length; j++) {
+    var st = stashes[j];
+    if (!st || !st.data) continue;
+    var parent = (st.branchName && branches.hasOwnProperty(st.branchName))
+      ? branches[st.branchName] : null;
+    var id = st.id;
+    while (s.objects.hasOwnProperty(id)) id = id + 'x';   // 既存IDと衝突しないようにする
+    s.objects[id] = {
+      id: id, parent: parent, parent2: null,
+      message: st.message || 'スタッシュ（移行）',
+      author: st.author || 'unknown',
+      timestamp: st.timestamp || '',
+      payload: { type: 'full', data: st.data },           // st.data は gzip+Base64 のスナップショット
+      stash: true
+    };
+  }
+
+  delete s.branches;
+  delete s.head;
+  delete s.stashes;
+  s.version = 3;
+  if (s.gen === undefined) s.gen = 0;
+  return s;
+}
+
+/**
+ * 現在地 working（コミットID）を解決する。store.working が有効な object を指せばそれを返す。
+ * 未設定（または無効）なら null。jj では working は名前ではなくコミットID。
+ */
+function Ggit_resolveWorking(doc, store) {
+  if (store.working && store.objects.hasOwnProperty(store.working)) return store.working;
+  return null;
 }
