@@ -106,6 +106,26 @@ function Ggit_tabBodyEndIndex_(docRes, tabId) {
   return (last && last.endIndex) ? last.endIndex : 1;
 }
 
+/**
+ * Docs API 経由でタブ本文末尾へテキストを追記する（削除を伴わない単一リクエスト）。
+ *
+ * `.vcs` 追記型ログ（JSONL）の通常保存で用いる。本文を全置換する `Ggit_setTabTextApi`
+ * と異なり、既存内容を残したまま末尾に挿入するため書き込みコストが O(追記分) で済む。
+ * 末尾の暗黙改行の手前（endIndex - 1）へ挿入する。空本文時は index 1 へ挿入する。
+ */
+function Ggit_appendTabTextApi(docId, tabId, text) {
+  if (!text || !text.length) return;
+  var docRes = Docs.Documents.get(docId, {
+    includeTabsContent: true,
+    fields: 'tabs(tabProperties/tabId,childTabs,documentTab(body(content(endIndex))))'
+  });
+  var endIndex = Ggit_tabBodyEndIndex_(docRes, tabId);
+  var at = (endIndex > 1) ? endIndex - 1 : 1; // 末尾改行の手前（空本文は 1）
+  Docs.Documents.batchUpdate({
+    requests: [{ insertText: { location: { index: at, tabId: tabId }, text: text } }]
+  }, docId);
+}
+
 /** Docs API のドキュメントから全タブID（子タブ含む）を平坦に集める。 */
 function Ggit_docsTabIds(docId) {
   var docRes = Docs.Documents.get(docId, { includeTabsContent: false });

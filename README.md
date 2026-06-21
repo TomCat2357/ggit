@@ -99,6 +99,7 @@ npm run push   # clasp push
   - `https://www.googleapis.com/auth/script.container.ui` — メニュー／ダイアログ表示用。
   - `https://www.googleapis.com/auth/userinfo.email` — コミット作者の**メールアドレス**取得用。
   - `https://www.googleapis.com/auth/userinfo.profile` — コミット作者の**ユーザー名**（People API）取得用。
+  - `https://www.googleapis.com/auth/script.scriptapp` — PropertiesService バックアップを**非同期実行**する時間トリガの作成用。
 
 プッシュ後、対象ドキュメントを開き直すと、メニューバーに **「ggit」** が表示されます。
 
