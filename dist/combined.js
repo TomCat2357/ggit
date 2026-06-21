@@ -2358,14 +2358,49 @@ function Ggit_goto(target) {
  * Jujutsu と同様、ブックマークは commit では動かさない（明示操作でのみ移動）。
  */
 
-/** コミット作者（取得できなければ 'unknown'）。 */
-function Ggit_author() {
+/**
+ * コミット作者の表示名（ユーザー名）。People API（要 userinfo.profile スコープ）で
+ * 自分のプロフィール名を引く。取得できなければ空文字。
+ * 一次名（metadata.primary）を優先し、無ければ先頭の displayName を使う。
+ */
+function Ggit_authorName_() {
   try {
-    var e = Session.getActiveUser().getEmail();
-    return e || 'unknown';
+    var resp = People.People.get('people/me', { personFields: 'names' });
+    var names = (resp && resp.names) || [];
+    for (var i = 0; i < names.length; i++) {
+      if (names[i].metadata && names[i].metadata.primary && names[i].displayName) {
+        return names[i].displayName;
+      }
+    }
+    if (names.length && names[0].displayName) return names[0].displayName;
+  } catch (_) {}
+  return '';
+}
+
+/** コミット作者のメールアドレス（要 userinfo.email スコープ）。取得できなければ空文字。 */
+function Ggit_authorEmail_() {
+  try {
+    return Session.getActiveUser().getEmail() || '';
   } catch (_) {
-    return 'unknown';
+    return '';
   }
+}
+
+/**
+ * コミット作者を git 形式の識別子「ユーザー名 <メールアドレス>」で返す。
+ *  - 名前・メールが揃う … "名前 <メール>"
+ *  - メールのみ取得     … "メール"
+ *  - 名前のみ取得       … "名前"
+ *  - どちらも取れない   … 'unknown'
+ * 旧コミット（author が生メールのみ）とも互換: author は単一文字列のまま。
+ */
+function Ggit_author() {
+  var name = Ggit_authorName_();
+  var email = Ggit_authorEmail_();
+  if (name && email) return name + ' <' + email + '>';
+  if (email) return email;
+  if (name) return name;
+  return 'unknown';
 }
 
 /** ISO8601（タイムゾーンオフセット付き）のタイムスタンプ。 */
@@ -3007,7 +3042,7 @@ function Ggit_commitId(store, parent, timestamp, fullText) {
  * Log はブランチ（分岐）を意識した ASCII レーングラフで表示し、フラット表示にも切替できる。
  * スタッシュは objects 内の仮コミット（stash:true）として一覧し、pop（戻して消す）/ drop できる。
  * Log（グラフ）画面を操作ハブとし、行を選択して diff / merge / bookmark / 移動(goto) を実行できる
- * （goto は専用ダイアログ「Goto…」からも可能。diff/merge/bookmark のメニュー項目は廃止した）。
+ * （diff/merge/bookmark/goto のメニュー項目は廃止し、すべて Log（グラフ）画面に統合した）。
  */
 
 /**
@@ -3023,7 +3058,6 @@ function onOpen() {
     .addSeparator()
     .addItem('Commit…', 'ggitUI_commit')
     .addItem('Log（グラフ・操作ハブ）', 'ggitUI_log')
-    .addItem('Goto…', 'ggitUI_goto')
     .addItem('ステータス', 'ggitUI_status')
     .addSeparator()
     .addItem('修復（壊れた履歴の復旧）', 'ggitUI_repair')
@@ -3133,22 +3167,40 @@ function ggitUI_setup() {
   }
 }
 
+/**
+ * Commit ダイアログ。
+ *
+ * ネイティブの ui.prompt は Enter での確定が効かないため、テキスト入力に Enter キーで
+ * コミットできる独自モーダルにする（要望: コミット時に Enter だけで確定）。
+ * 成功メッセージは簡潔に（要望: 「ブックマークは動きません」の案内は不要）。
+ */
 function ggitUI_commit() {
   var ui = DocumentApp.getUi();
   if (!Ggit_uiRequireInit_(ui)) return;
-  var res = ui.prompt('ggit commit', 'コミットメッセージを入力してください:', ui.ButtonSet.OK_CANCEL);
-  if (res.getSelectedButton() !== ui.Button.OK) return;
-  var msg = (res.getResponseText() || '').trim();
-  if (!msg) { ui.alert('ggit commit', 'メッセージが空です。中止しました。', ui.ButtonSet.OK); return; }
-  try {
-    var id = Ggit_commit(msg);
-    ui.alert('ggit commit',
-      'コミットしました: ' + id + '\n' +
-      '作者: ' + Ggit_author() + '\n' +
-      '（現在地 @ をこのコミットへ進めました。ブックマークは動きません。）', ui.ButtonSet.OK);
-  } catch (e) {
-    ui.alert('ggit commit', e.message, ui.ButtonSet.OK);
-  }
+  var html =
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:6px">' +
+    '<p style="margin:0 0 6px">コミットメッセージを入力してください（<b>Enter</b> でコミット）:</p>' +
+    '<input id="msg" type="text" style="width:100%;box-sizing:border-box" />' +
+    '<div style="margin-top:8px">' +
+    '<button id="ok">コミット</button> ' +
+    '<button id="cancel">キャンセル</button></div>' +
+    '<div id="out" style="margin-top:8px;min-height:18px"></div>' +
+    '<script>' +
+    'function el(id){return document.getElementById(id);}' +
+    'function run(){var msg=(el("msg").value||"").trim();' +
+    'if(!msg){el("out").style.color="#d93025";el("out").textContent="メッセージが空です。";el("msg").focus();return;}' +
+    'el("ok").disabled=true;el("out").style.color="#188038";el("out").textContent="コミット中…";' +
+    'google.script.run.withSuccessHandler(function(id){' +
+    'el("out").textContent="コミットしました: "+id;' +
+    'setTimeout(function(){google.script.host.close();},800);})' +
+    '.withFailureHandler(function(e){el("ok").disabled=false;el("out").style.color="#d93025";el("out").textContent=e.message;el("msg").focus();})' +
+    '.Ggit_commit(msg);}' +
+    'el("ok").addEventListener("click",run);' +
+    'el("cancel").addEventListener("click",function(){google.script.host.close();});' +
+    'el("msg").addEventListener("keydown",function(e){if(e.keyCode===13){e.preventDefault();run();}});' +
+    'el("msg").focus();' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit commit', 460, 200);
 }
 
 /**
@@ -3225,10 +3277,11 @@ function ggitUI_log() {
     '<button id="opMerge">＠へマージ</button></div>' +
     '<div class="pr"><span class="lbl">bookmark:</span>' +
     '<input id="bmName" type="text" placeholder="main など" /> ' +
-    '<button id="opBmSet">設定/移動</button>' +
+    '<button id="opBmSet">設定</button>' +
     '<span id="bmList" class="bmlist"></span></div>' +
     '<div class="pr"><span class="lbl">diff:</span>' +
-    'A <select id="dA"></select> B <select id="dB"></select> ' +
+    'A <input id="dFilterA" type="text" placeholder="A絞り込み（ID・メッセージ）" style="width:150px" /> <select id="dA"></select> ' +
+    'B <input id="dFilterB" type="text" placeholder="B絞り込み（ID・メッセージ）" style="width:150px" /> <select id="dB"></select> ' +
     '<button id="opDiff">差分表示</button></div>' +
     '<div id="diffOut" class="diffout"></div>' +
     '</div>';
@@ -3281,10 +3334,7 @@ function ggitUI_log() {
     'function renderHeader(){var host=el("header");host.innerHTML="";if(!DATA)return;' +
     'if(!DATA.working){host.appendChild(span("help","(現在地なし — Commit でコミットを作成してください)"));return;}' +
     'host.appendChild(span("at","現在地 @ "));host.appendChild(span("hash",DATA.working));' +
-    'var wn=nodeMap()[DATA.working]||null;if(wn){var i;' +
-    'if(wn.refs){for(i=0;i<wn.refs.length;i++){host.appendChild(txt(" "));host.appendChild(span("chip",wn.refs[i]));}}' +
-    'host.appendChild(txt("  "));host.appendChild(span(null,wn.message||""));' +
-    'host.appendChild(txt("  "));host.appendChild(span("author",wn.author||""));}}' +
+    'var wn=nodeMap()[DATA.working]||null;if(wn&&wn.refs){for(var i=0;i<wn.refs.length;i++){host.appendChild(txt(" "));host.appendChild(span("chip",wn.refs[i]));}}}' +
     'function renderBookmarks(){var host=el("bmList");host.innerHTML="";' +
     'if(!DATA||!DATA.bookmarks||!DATA.bookmarks.length){host.appendChild(span("help","（ブックマークなし）"));return;}' +
     'for(var i=0;i<DATA.bookmarks.length;i++){var b=DATA.bookmarks[i];' +
@@ -3304,12 +3354,17 @@ function ggitUI_log() {
     't4.appendChild(txt(" "));' +
     'var drp=document.createElement("button");drp.textContent="破棄";drp.setAttribute("data-act","drop");drp.setAttribute("data-id",o.id);t4.appendChild(drp);' +
     'tr.appendChild(t4);table.appendChild(tr);}host.appendChild(table);}' +
-    'function fillSelect(sel,chosen){sel.innerHTML="";var list=commitList();for(var i=0;i<list.length;i++){var c=list[i];' +
+    'function diffFilterText(id){var f=el(id);return f?(f.value||"").trim().toLowerCase():"";}' +
+    'function diffMatch(c,q){if(!q)return true;return ((c.id||"").toLowerCase().indexOf(q)>=0)||((c.message||"").toLowerCase().indexOf(q)>=0);}' +
+    'function fillSelect(sel,chosen,filterId){var q=diffFilterText(filterId);sel.innerHTML="";var list=commitList();for(var i=0;i<list.length;i++){var c=list[i];' +
+    'if(!diffMatch(c,q))continue;' +
     'var op=document.createElement("option");op.value=c.id;op.textContent=c.id+" — "+(c.message||"");if(c.id===chosen)op.selected=true;sel.appendChild(op);}}' +
+    'function refillDiffA(){fillSelect(el("dA"),el("dA").value,"dFilterA");}' +
+    'function refillDiffB(){fillSelect(el("dB"),el("dB").value,"dFilterB");}' +
     'function selParent(){var n=SEL?nodeMap()[SEL]:null;return n?n.parent:null;}' +
     'function diffDefB(){return SEL||(DATA&&DATA.working)||(commitList()[0]&&commitList()[0].id)||"";}' +
     'function diffDefA(){return selParent()||diffDefB();}' +
-    'function renderDiffSelectors(){fillSelect(el("dA"),diffDefA());fillSelect(el("dB"),diffDefB());}' +
+    'function renderDiffSelectors(){fillSelect(el("dA"),diffDefA(),"dFilterA");fillSelect(el("dB"),diffDefB(),"dFilterB");}' +
     'function renderPanelSel(){el("selInfo").textContent=SEL?("選択: "+SEL):"（行をクリックして選択）";' +
     'if(el("dA"))el("dA").value=diffDefA();if(el("dB"))el("dB").value=diffDefB();' +
     'var has=!!SEL;el("opGoto").disabled=!has;el("opMerge").disabled=!has;el("opBmSet").disabled=!has;}' +
@@ -3355,6 +3410,8 @@ function ggitUI_log() {
     'el("opMerge").addEventListener("click",mergeInto);' +
     'el("opBmSet").addEventListener("click",bmSet);' +
     'el("opDiff").addEventListener("click",runDiff);' +
+    'el("dFilterA").addEventListener("input",refillDiffA);' +
+    'el("dFilterB").addEventListener("input",refillDiffB);' +
     'el("list").addEventListener("click",function(e){var b=e.target.closest("button[data-act]");' +
     'if(b){if(b.getAttribute("data-act")==="abandon")abandon(b.getAttribute("data-id"),b.getAttribute("data-hasstash")==="1");return;}' +
     'var row=e.target.closest("tr[data-id]");if(row)selectCommit(row.getAttribute("data-id"));});' +
@@ -4760,7 +4817,8 @@ function Ggit_isInitialized(doc) {
  */
 function Ggit_setup() {
   var doc = DocumentApp.getActiveDocument();
-  try { Session.getActiveUser().getEmail(); } catch (_) {} // 認可スコープに触れる
+  try { Session.getActiveUser().getEmail(); } catch (_) {}                 // userinfo.email スコープに触れる
+  try { People.People.get('people/me', { personFields: 'names' }); } catch (_) {} // userinfo.profile（People）に触れる
   var existed = Ggit_isInitialized(doc);
   if (!existed) {
     Ggit_storeSave(doc, Ggit_emptyStore()); // `.vcs` を空ストアで生成（Docs API 書き込み）

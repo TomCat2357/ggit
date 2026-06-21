@@ -83,7 +83,8 @@ function Ggit_isInitialized(doc) {
  */
 function Ggit_setup() {
   var doc = DocumentApp.getActiveDocument();
-  try { Session.getActiveUser().getEmail(); } catch (_) {} // 認可スコープに触れる
+  try { Session.getActiveUser().getEmail(); } catch (_) {}                 // userinfo.email スコープに触れる
+  try { People.People.get('people/me', { personFields: 'names' }); } catch (_) {} // userinfo.profile（People）に触れる
   var existed = Ggit_isInitialized(doc);
   if (!existed) {
     Ggit_storeSave(doc, Ggit_emptyStore()); // `.vcs` を空ストアで生成（Docs API 書き込み）

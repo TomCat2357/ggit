@@ -6,14 +6,49 @@
  * Jujutsu と同様、ブックマークは commit では動かさない（明示操作でのみ移動）。
  */
 
-/** コミット作者（取得できなければ 'unknown'）。 */
-function Ggit_author() {
+/**
+ * コミット作者の表示名（ユーザー名）。People API（要 userinfo.profile スコープ）で
+ * 自分のプロフィール名を引く。取得できなければ空文字。
+ * 一次名（metadata.primary）を優先し、無ければ先頭の displayName を使う。
+ */
+function Ggit_authorName_() {
   try {
-    var e = Session.getActiveUser().getEmail();
-    return e || 'unknown';
+    var resp = People.People.get('people/me', { personFields: 'names' });
+    var names = (resp && resp.names) || [];
+    for (var i = 0; i < names.length; i++) {
+      if (names[i].metadata && names[i].metadata.primary && names[i].displayName) {
+        return names[i].displayName;
+      }
+    }
+    if (names.length && names[0].displayName) return names[0].displayName;
+  } catch (_) {}
+  return '';
+}
+
+/** コミット作者のメールアドレス（要 userinfo.email スコープ）。取得できなければ空文字。 */
+function Ggit_authorEmail_() {
+  try {
+    return Session.getActiveUser().getEmail() || '';
   } catch (_) {
-    return 'unknown';
+    return '';
   }
+}
+
+/**
+ * コミット作者を git 形式の識別子「ユーザー名 <メールアドレス>」で返す。
+ *  - 名前・メールが揃う … "名前 <メール>"
+ *  - メールのみ取得     … "メール"
+ *  - 名前のみ取得       … "名前"
+ *  - どちらも取れない   … 'unknown'
+ * 旧コミット（author が生メールのみ）とも互換: author は単一文字列のまま。
+ */
+function Ggit_author() {
+  var name = Ggit_authorName_();
+  var email = Ggit_authorEmail_();
+  if (name && email) return name + ' <' + email + '>';
+  if (email) return email;
+  if (name) return name;
+  return 'unknown';
 }
 
 /** ISO8601（タイムゾーンオフセット付き）のタイムスタンプ。 */
