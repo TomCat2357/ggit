@@ -2308,6 +2308,70 @@ function Ggit_setTabText(tab, text) {
 }
 
 /**
+ * Docs API 経由でタブ本文をプレーンテキストで上書きする。
+ *
+ * `Ggit_setTabText`（DocumentApp）は、`Ggit_createTab` が `openById` で開いた
+ * 「2つ目のライブインスタンス」のタブに書くと、実行終了時のフラッシュ競合で
+ * 書き込みが失われることがある（新規タブ本文や `.vcs` 生成時に顕在化）。
+ * 本関数は DocumentApp を介さず Docs API で書くため、その競合を回避する。
+ *
+ * 既存本文を deleteContentRange で削除してから insertText する。本文末尾の改行は
+ * 削除できないため範囲は `endIndex - 1` まで。すべての Location/Range には対象タブを
+ * 指す `tabId` を付与する。
+ */
+function Ggit_setTabTextApi(docId, tabId, text) {
+  var docRes = Docs.Documents.get(docId, {
+    includeTabsContent: true,
+    fields: 'tabs(tabId,childTabs,documentTab(body(content(endIndex))))'
+  });
+  var endIndex = Ggit_tabBodyEndIndex_(docRes, tabId);
+
+  var requests = [];
+  // 既存本文（index 1 .. endIndex-1）を削除。末尾改行のみ（endIndex<=2）なら何もしない。
+  if (endIndex > 2) {
+    requests.push({
+      deleteContentRange: {
+        range: { startIndex: 1, endIndex: endIndex - 1, tabId: tabId }
+      }
+    });
+  }
+  // 新本文を本文先頭（index 1）へ挿入。
+  if (text && text.length) {
+    requests.push({
+      insertText: { location: { index: 1, tabId: tabId }, text: text }
+    });
+  }
+  if (requests.length) {
+    Docs.Documents.batchUpdate({ requests: requests }, docId);
+  }
+}
+
+/**
+ * Docs.Documents.get レスポンスから、指定タブの本文末尾 index を求める。
+ * タブ木（childTabs）を再帰的に辿って tabId 一致タブを探し、その
+ * documentTab.body.content 末尾要素の endIndex を返す。空本文時は 1 を返す。
+ */
+function Ggit_tabBodyEndIndex_(docRes, tabId) {
+  var found = null;
+  (function rec(tabs) {
+    if (!tabs) return;
+    for (var i = 0; i < tabs.length; i++) {
+      if (found) return;
+      if (tabs[i].tabId === tabId) { found = tabs[i]; return; }
+      rec(tabs[i].childTabs);
+    }
+  })(docRes.tabs);
+
+  if (!found || !found.documentTab || !found.documentTab.body ||
+      !found.documentTab.body.content) {
+    throw new Error('Docs API レスポンスから対象タブの本文を特定できませんでした: ' + tabId);
+  }
+  var content = found.documentTab.body.content;
+  var last = content[content.length - 1];
+  return (last && last.endIndex) ? last.endIndex : 1;
+}
+
+/**
  * Docs 拡張サービス経由で新規ドキュメントタブを生成し、生成された Tab を返す。
  *
  * `DocumentApp` 本体にタブ追加メソッドは無いため、Docs API の batchUpdate
@@ -2346,18 +2410,29 @@ function Ggit_createTab(doc, title) {
 /**
  * Store.js — オブジェクトストア（コミットグラフ）の永続化。
  *
- * 配置は設計仕様書 §5.2 の「案A」を採用し、`.vcs` というタイトルの
- * ドキュメントタブ本文に JSON 文字列としてストアを格納する。
+ * 配置は設計仕様書 §5.2 の「案A」を基本としつつ、Google ネイティブ版復元
+ * （ファイル > 変更履歴 > この版に戻す）への耐性のため PropertiesService
+ * （DocumentProperties）への外部バックアップを併設する「ハイブリッド」方式を採る。
+ *
+ * 背景: ネイティブ版復元はドキュメント全体を巻き戻すため、`.vcs` タブもろとも
+ * メタストアが過去へ戻り、それ以降の履歴が失われる。DocumentProperties は
+ * ドキュメント本文ではないため版復元の影響を受けない。これを「正」として保持し、
+ * 単調増加の世代カウンタ `gen` で巻き戻しを検知して履歴を復旧する（設計仕様書 §5.2）。
  *
  * ストア構造:
  * {
  *   "version": 1,
+ *   "gen":      0,            // 単調増加の世代カウンタ（保存ごとに +1）
  *   "objects":  { <commitId>: <commitObject>, ... },
  *   "branches": { <tabId>: { "head": <commitId>, "name": <string> }, ... }
  * }
  */
 
 var GGIT_META_TITLE = '.vcs';
+
+/** PropertiesService バックアップのキー接頭辞とチャンクサイズ。 */
+var GGIT_BK_PREFIX = 'ggit.bk.';        // ggit.bk.gen / ggit.bk.count / ggit.bk.<i>
+var GGIT_BK_CHUNK = 8000;               // 1プロパティ値の上限(~9KB)を下回るチャンク長
 
 /** `.vcs` メタタブを返す（無ければ null）。 */
 function Ggit_metaTab(doc) {
@@ -2370,36 +2445,176 @@ function Ggit_metaTab(doc) {
 
 /** 空のストアを生成。 */
 function Ggit_emptyStore() {
-  return { version: 1, objects: {}, branches: {} };
+  return { version: 1, gen: 0, objects: {}, branches: {} };
 }
 
-/** メタタブからストアを読み込む（無ければ空ストア）。 */
+/** ストアオブジェクトの欠損フィールドを既定値で補う（タブ/バックアップ共通）。 */
+function Ggit_normStore(s) {
+  s.version = s.version || 1;
+  s.gen = s.gen || 0;
+  s.objects = s.objects || {};
+  s.branches = s.branches || {};
+  return s;
+}
+
+/**
+ * メタタブと PropertiesService バックアップの両方を読み、世代の新しい方を採用する。
+ *
+ * ネイティブ版復元で `.vcs` タブが巻き戻された場合（backup.gen > tab.gen）は
+ * バックアップを正として返し、履歴喪失を防ぐ。タブへの書き戻し（ヒール）は副作用を
+ * 避けるため行わず、次回 `Ggit_storeSave` で自動反映される（遅延ヒール）。
+ */
 function Ggit_storeLoad(doc) {
   doc = doc || DocumentApp.getActiveDocument();
+  var tabStore = Ggit_tabStoreLoad(doc);
+  var backupStore = Ggit_backupLoad(doc);
+  return Ggit_pickStore(tabStore, backupStore);
+}
+
+/** メタタブ（`.vcs`）本文のみからストアを読み込む（無ければ null）。 */
+function Ggit_tabStoreLoad(doc) {
   var t = Ggit_metaTab(doc);
-  if (!t) return Ggit_emptyStore();
+  if (!t) return null;
   var raw = Ggit_tabText(t).trim();
-  if (!raw) return Ggit_emptyStore();
+  if (!raw) return null;
   var s;
   try {
     s = JSON.parse(raw);
   } catch (e) {
     throw new Error('.vcs メタタブのJSON解析に失敗しました（手動編集の可能性）: ' + e.message);
   }
-  s.version = s.version || 1;
-  s.objects = s.objects || {};
-  s.branches = s.branches || {};
-  return s;
+  return Ggit_normStore(s);
 }
 
-/** ストアをメタタブへ書き戻す（メタタブが無ければ生成）。 */
+/**
+ * タブストアとバックアップストアから採用するストアを決定する（純粋関数）。
+ *  - 両方 null      → 空ストア。
+ *  - 片方のみ存在    → 在る方。
+ *  - 両方存在        → gen の大きい方（同点はタブを優先）。
+ * backup.gen > tab.gen はネイティブ版復元によるタブ巻き戻しのシグナル。
+ */
+function Ggit_pickStore(tabStore, backupStore) {
+  if (!tabStore && !backupStore) return Ggit_emptyStore();
+  if (!backupStore) return tabStore;
+  if (!tabStore) return backupStore;
+  return (backupStore.gen > tabStore.gen) ? backupStore : tabStore;
+}
+
+/**
+ * ストアをメタタブと PropertiesService バックアップの両方へ保存する。
+ * 世代カウンタを +1 し、巻き戻しに耐えるバックアップ（Properties）を **先に** 書いてから
+ * タブへ書く。バックアップは best-effort（容量超過等でも throw せず警告を返す）。
+ * 戻り値: { gen, warning }（warning は失敗時のみ文字列、成功時 null）。
+ */
 function Ggit_storeSave(doc, store) {
   doc = doc || DocumentApp.getActiveDocument();
+  var docId = doc.getId();
+  store.gen = (store.gen || 0) + 1;
+
+  // 先にバックアップ（Properties は版復元の影響を受けないため、ここが「正」の砦）。
+  var warning = Ggit_backupSave(doc, store);
+
   var t = Ggit_metaTab(doc);
   if (!t) {
     t = Ggit_createTab(doc, GGIT_META_TITLE);
   }
-  Ggit_setTabText(t, JSON.stringify(store));
+  // DocumentApp の二重インスタンスによる書き込み消失（特に `.vcs` 初回生成時）を避けるため
+  // Docs API 経由で書き込む。
+  Ggit_setTabTextApi(docId, t.getId(), JSON.stringify(store));
+  return { gen: store.gen, warning: warning };
+}
+
+/* ===================== PropertiesService バックアップ（ハイブリッド） ===================== */
+
+/**
+ * ストアを gzip+Base64 圧縮し、~8KB チャンクに分割して DocumentProperties へ保存する。
+ * 容量上限（合計 ~500KB）超過などで失敗した場合は throw せず警告文字列を返す（best-effort）。
+ * 成功時は null を返す。
+ */
+function Ggit_backupSave(doc, store) {
+  try {
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) return 'バックアップ不可（DocumentProperties が利用できません）。';
+    var payload = Ggit_gzipB64(JSON.stringify(store));
+    var chunks = Ggit_chunk(payload, GGIT_BK_CHUNK);
+
+    // 旧チャンクを削除してから新チャンクを書く（チャンク数が減った場合の残骸を残さない）。
+    var keys = props.getKeys();
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].indexOf(GGIT_BK_PREFIX) === 0) props.deleteProperty(keys[i]);
+    }
+    var map = { 'ggit.bk.gen': String(store.gen || 0), 'ggit.bk.count': String(chunks.length) };
+    for (var j = 0; j < chunks.length; j++) map[GGIT_BK_PREFIX + j] = chunks[j];
+    props.setProperties(map);
+    return null;
+  } catch (e) {
+    Logger.log('ggit backup 失敗（履歴本体はタブに保存済み）: ' + e.message);
+    return 'PropertiesService バックアップに失敗しました（容量上限の可能性）。' +
+      'タブには保存済みですが、ネイティブ版復元への耐性は今回縮退します: ' + e.message;
+  }
+}
+
+/** DocumentProperties のバックアップからストアを復元する（無ければ null）。 */
+function Ggit_backupLoad(doc) {
+  try {
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) return null;
+    var countStr = props.getProperty('ggit.bk.count');
+    if (!countStr) return null;
+    var count = parseInt(countStr, 10);
+    if (!(count > 0)) return null;
+    var parts = [];
+    for (var i = 0; i < count; i++) {
+      var c = props.getProperty(GGIT_BK_PREFIX + i);
+      if (c == null) return null; // 欠損チャンク → バックアップ不完全とみなし無効
+      parts.push(c);
+    }
+    var json = Ggit_gunzipB64(parts.join(''));
+    return Ggit_normStore(JSON.parse(json));
+  } catch (e) {
+    Logger.log('ggit backup 読込失敗: ' + e.message);
+    return null;
+  }
+}
+
+/** バックアップの現在の使用バイト数（Base64 圧縮後の総文字数）。無ければ 0。 */
+function Ggit_backupBytes(doc) {
+  try {
+    var props = PropertiesService.getDocumentProperties();
+    if (!props) return 0;
+    var countStr = props.getProperty('ggit.bk.count');
+    if (!countStr) return 0;
+    var count = parseInt(countStr, 10);
+    var total = 0;
+    for (var i = 0; i < count; i++) {
+      var c = props.getProperty(GGIT_BK_PREFIX + i);
+      if (c) total += c.length;
+    }
+    return total;
+  } catch (e) {
+    return 0;
+  }
+}
+
+/** 文字列を size 文字ごとのチャンク配列へ分割する（純粋関数）。 */
+function Ggit_chunk(str, size) {
+  var out = [];
+  for (var i = 0; i < str.length; i += size) out.push(str.substring(i, i + size));
+  return out;
+}
+
+/**
+ * 認可を確実に発火させるための no-op 認可関数（Setup メニューから呼ぶ）。
+ *
+ * onOpen は AuthMode.NONE で動くため、初回の本格操作（commit 等）で認可ダイアログが
+ * 出ると、その関数は再実行されずに中断される。本関数を先に一度実行して認可を済ませることで、
+ * 最初の commit が認可中断で消える事象を避ける。ドキュメント名とタブ数を返す。
+ */
+function Ggit_authorize() {
+  var doc = DocumentApp.getActiveDocument();
+  var tabs = Ggit_allTabs(doc); // documents スコープに触れる読み取り
+  try { Session.getActiveUser().getEmail(); } catch (_) {}
+  return { title: doc.getName(), tabCount: tabs.length };
 }
 /**
  * Snapshot.js — payload（full/delta）の生成・復元と gzip+Base64 圧縮。
@@ -2479,6 +2694,169 @@ function Ggit_materialize(store, id) {
   }
   return text;
 }
+
+/* ===================== 書式付きスナップショット（スコープ①: 記録＋復元） ===================== */
+/*
+ * payload に格納する「素材」を、プレーンテキストから構造化 JSON 文字列に拡張する。
+ *   { "v":1, "text": <body.getText() と一致する全文>,
+ *     "fmt": { "runs":[{s,e,a}], "paras":[{i,a}] } }
+ * - text を diff/merge がそのまま射影（Ggit_plainOf）して使うため、プレーン処理は無改変。
+ * - fmt を含めて比較することで「テキスト同一・書式のみ変更」を commit が検知できる。
+ * - 圧縮/delta/コミットID は文字列処理なので、この JSON 文字列をそのまま流せる（無改修）。
+ *
+ * 後方互換: 旧 `.vcs`（payload が生プレーンテキスト）も Ggit_parseSnap / Ggit_plainOf が
+ * 透過的に読めるため、既存ドキュメントを壊さない。
+ *
+ * フィデリティ境界（①）: 文字書式・段落書式のみ対応。表/画像/リストのグリフ・ネストは
+ * 非対応（テキストとしては保持されるが書式は復元しない）。設計仕様書 §7.3 に整合。
+ */
+
+/** スナップショット文字列を { v, text, fmt } へ復号。旧プレーン payload は {text:raw} 扱い。 */
+function Ggit_parseSnap(s) {
+  if (s == null) return { v: 0, text: '', fmt: null };
+  var o = null;
+  try { o = JSON.parse(s); } catch (e) { o = null; }
+  if (o && typeof o === 'object' && o.v && typeof o.text === 'string') return o;
+  // 旧形式（生プレーンテキスト）または非該当 JSON はそのままテキストとして扱う。
+  return { v: 0, text: String(s), fmt: null };
+}
+
+/** スナップショット文字列からプレーン全文を取り出す（diff/merge 用・後方互換）。 */
+function Ggit_plainOf(s) {
+  return Ggit_parseSnap(s).text;
+}
+
+/** オブジェクトに列挙可能キーが1つでもあるか。 */
+function Ggit_hasKeys(o) {
+  for (var k in o) { if (o.hasOwnProperty(k)) return true; }
+  return false;
+}
+
+/** 文字列値の属性名→列挙型のマップ（①で復元対象とする段落系 enum のみ）。 */
+function Ggit_enumFromString(attrKey, name) {
+  var maps = {
+    HEADING: DocumentApp.ParagraphHeading,
+    HORIZONTAL_ALIGNMENT: DocumentApp.HorizontalAlignment
+  };
+  var e = maps[attrKey];
+  if (!e) return null;
+  var v = e[name];
+  return v === undefined ? null : v;
+}
+
+/**
+ * getAttributes() の戻り値を JSON 安全な形へ正規化する。
+ * - null/undefined は捨てる（未設定属性でストアを肥大させない）。
+ * - 文字列/数値/真偽はそのまま。
+ * - それ以外（列挙型など）は { __enum: <toString> } で名前を保持する。
+ */
+function Ggit_normAttrs(attrs) {
+  var out = {};
+  for (var k in attrs) {
+    if (!attrs.hasOwnProperty(k)) continue;
+    var v = attrs[k];
+    if (v === null || v === undefined) continue;
+    var tv = typeof v;
+    if (tv === 'string' || tv === 'number' || tv === 'boolean') {
+      out[k] = v;
+    } else {
+      out[k] = { __enum: String(v) };
+    }
+  }
+  return out;
+}
+
+/** 正規化属性を setAttributes() 適用可能な形へ戻す。復元不能な enum は捨てる（①の境界）。 */
+function Ggit_denormAttrs(obj) {
+  var out = {};
+  for (var k in obj) {
+    if (!obj.hasOwnProperty(k)) continue;
+    var v = obj[k];
+    if (v && typeof v === 'object' && v.__enum !== undefined) {
+      var e = Ggit_enumFromString(k, v.__enum);
+      if (e !== null) out[k] = e; // 未対応 enum は適用しない
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** body の段落系要素（Paragraph / ListItem）を本文順で返す。 */
+function Ggit_paraElements(body) {
+  var out = [];
+  var n = body.getNumChildren();
+  for (var i = 0; i < n; i++) {
+    var c = body.getChild(i);
+    var t = c.getType();
+    if (t === DocumentApp.ElementType.PARAGRAPH || t === DocumentApp.ElementType.LIST_ITEM) {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+/**
+ * タブ本文を書式付きスナップショット文字列としてシリアライズする。
+ * 文字書式は body.editAsText() の属性区間、段落書式は段落系要素の属性として取得する。
+ */
+function Ggit_serializeTab(tab) {
+  var body = tab.asDocumentTab().getBody();
+  var text = body.getText();
+
+  var runs = [];
+  if (text.length > 0) {
+    var et = body.editAsText();
+    var idx = et.getTextAttributeIndices();
+    for (var i = 0; i < idx.length; i++) {
+      var s = idx[i];
+      var e = (i + 1 < idx.length) ? idx[i + 1] - 1 : text.length - 1; // 終端は inclusive
+      if (e < s) continue;
+      runs.push({ s: s, e: e, a: Ggit_normAttrs(et.getAttributes(s)) });
+    }
+  }
+
+  var paras = [];
+  var pels = Ggit_paraElements(body);
+  for (var j = 0; j < pels.length; j++) {
+    paras.push({ i: j, a: Ggit_normAttrs(pels[j].getAttributes()) });
+  }
+
+  return JSON.stringify({ v: 1, text: text, fmt: { runs: runs, paras: paras } });
+}
+
+/**
+ * スナップショット文字列をタブ本文へ復元する（テキスト＋書式）。
+ * setText 後に段落属性→文字属性の順で再適用する（段落の NamedStyle が文字属性を
+ * 上書きしうるため、文字属性を後に当てて明示書式を優先する）。
+ */
+function Ggit_restoreTab(tab, snapStr) {
+  var body = tab.asDocumentTab().getBody();
+  var snap = Ggit_parseSnap(snapStr);
+  var text = snap.text;
+  body.setText(text);
+  if (!snap.fmt) return; // 旧プレーン payload はテキストのみ復元。
+
+  var pels = Ggit_paraElements(body);
+  var paras = snap.fmt.paras || [];
+  for (var j = 0; j < paras.length; j++) {
+    var p = paras[j];
+    if (p.i < pels.length) {
+      var pa = Ggit_denormAttrs(p.a);
+      if (Ggit_hasKeys(pa)) pels[p.i].setAttributes(pa);
+    }
+  }
+
+  if (text.length > 0) {
+    var et = body.editAsText();
+    var runs = snap.fmt.runs || [];
+    for (var k = 0; k < runs.length; k++) {
+      var r = runs[k];
+      var ra = Ggit_denormAttrs(r.a);
+      if (Ggit_hasKeys(ra) && r.e >= r.s) et.setAttributes(r.s, r.e, ra);
+    }
+  }
+}
 /**
  * Commit.js — commit / log。
  *
@@ -2516,18 +2894,18 @@ function Ggit_commit(message) {
     throw new Error('.vcs メタタブはコミットできません。対象のタブを選択してください。');
   }
 
-  var text = Ggit_tabText(tab);
+  var snap = Ggit_serializeTab(tab); // テキスト＋書式の構造化スナップショット
   var store = Ggit_storeLoad(doc);
   var br = store.branches[tabId];
   var parent = br ? br.head : null;
 
-  if (parent && Ggit_materialize(store, parent) === text) {
+  if (parent && Ggit_materialize(store, parent) === snap) {
     throw new Error('変更がありません（前回コミットと同一の内容です）。');
   }
 
   var ts = Ggit_timestamp();
-  var id = Ggit_commitId(store, tabId, parent, ts, text);
-  var payload = Ggit_makePayload(store, parent, text);
+  var id = Ggit_commitId(store, tabId, parent, ts, snap);
+  var payload = Ggit_makePayload(store, parent, snap);
 
   store.objects[id] = {
     id: id,
@@ -2587,13 +2965,18 @@ function Ggit_branch(name) {
     throw new Error('分岐元タブに履歴がありません。先にコミットしてからブランチを作成してください。');
   }
 
-  var srcText = Ggit_tabText(srcTab);
+  var srcSnap = Ggit_serializeTab(srcTab);
   var newTab = Ggit_createTab(doc, name);
-  Ggit_setTabText(newTab, srcText);
+  var newTabId = newTab.getId();
+  // テキストだけでなく書式ごと複製する。新タブは openById 由来の別インスタンスに属するが、
+  // Ggit_storeSave が .vcs を Docs API（Ggit_setTabTextApi）で書くようになったため、
+  // アクティブ doc への DocumentApp 書き込みは無く、ここが唯一の DocumentApp 書き込みとなる。
+  // よって同一ドキュメント2インスタンスのフラッシュ競合（本文消失）は起きない。
+  Ggit_restoreTab(newTab, srcSnap);
 
-  store.branches[newTab.getId()] = { head: br.head, name: name };
+  store.branches[newTabId] = { head: br.head, name: name };
   Ggit_storeSave(doc, store);
-  return newTab.getId();
+  return newTabId;
 }
 
 /**
@@ -2615,7 +2998,8 @@ function Ggit_checkout(targetTabId) {
     clean: null
   };
   if (br) {
-    report.clean = (Ggit_materialize(store, br.head) === Ggit_tabText(tab));
+    // 書式差も「未コミットの変更」に反映するため、スナップショット同士で比較する。
+    report.clean = (Ggit_materialize(store, br.head) === Ggit_serializeTab(tab));
   }
   return report;
 }
@@ -2636,8 +3020,9 @@ function Ggit_diffHtml(textA, textB) {
 /** 2コミット間の差分HTML（UIダイアログから google.script.run で呼ばれる）。 */
 function Ggit_diffCommitsHtml(idA, idB) {
   var store = Ggit_storeLoad();
-  var a = Ggit_materialize(store, idA);
-  var b = Ggit_materialize(store, idB);
+  // diff はプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var a = Ggit_plainOf(Ggit_materialize(store, idA));
+  var b = Ggit_plainOf(Ggit_materialize(store, idB));
   return Ggit_diffHtml(a, b);
 }
 /**
@@ -2823,8 +3208,9 @@ function Ggit_merge(sourceTabId) {
     return { conflict: false, commitId: null, upToDate: true };
   }
 
-  var baseText = lca ? Ggit_materialize(store, lca) : '';
-  var srcText = Ggit_materialize(store, srcHead);
+  // 3-way マージはプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var baseText = lca ? Ggit_plainOf(Ggit_materialize(store, lca)) : '';
+  var srcText = Ggit_plainOf(Ggit_materialize(store, srcHead));
   var curText = Ggit_tabText(curTab); // 作業中本文（未コミット編集も取り込む）
 
   var merged = Ggit_diff3(
@@ -2836,9 +3222,12 @@ function Ggit_merge(sourceTabId) {
   }
 
   // クリーンマージ → parent2 付きマージコミットを記録。
+  // 合流結果（プレーン）を書き戻した後のタブをシリアライズし、全コミットを
+  // 同一のスナップショット表現で統一する（checkout 整合判定・後続 commit の比較が安定）。
   var ts = Ggit_timestamp();
   var msg = 'Merge ' + (srcBr.name || sourceTabId) + ' into ' + (curBr.name || curTabId);
-  var id = Ggit_commitId(store, curTabId, curHead, ts, merged.text);
+  var snap = Ggit_serializeTab(curTab);
+  var id = Ggit_commitId(store, curTabId, curHead, ts, snap);
   store.objects[id] = {
     id: id,
     branch: curTabId,
@@ -2847,7 +3236,7 @@ function Ggit_merge(sourceTabId) {
     message: msg,
     author: Ggit_author(),
     timestamp: ts,
-    payload: Ggit_makePayload(store, curHead, merged.text)
+    payload: Ggit_makePayload(store, curHead, snap)
   };
   store.branches[curTabId] = { head: id, name: curTab.getTitle() };
   Ggit_storeSave(doc, store);
@@ -2866,9 +3255,16 @@ function Ggit_merge(sourceTabId) {
 function _test_all() {
   _test_hash();
   _test_snapshotRoundTrip();
+  _test_plainOf();
+  _test_snapshotFormatString();
   _test_mergeNoConflict();
   _test_mergeConflict();
   _test_lca();
+  _test_restoreMaterialize();
+  _test_tabBodyEndIndex();
+  _test_diffDirection();
+  _test_pickStore();
+  _test_backupChunkRoundTrip();
   Logger.log('--- self-test 完了 ---');
 }
 
@@ -2927,6 +3323,43 @@ function _test_snapshotRoundTrip() {
   _ok('長い連鎖でも復元一致', Ggit_materialize(store, lastId) === t);
 }
 
+/** Ggit_plainOf の新形式抽出と旧プレーン payload 後方互換（純粋関数）。 */
+function _test_plainOf() {
+  var newSnap = JSON.stringify({ v: 1, text: 'a\nb', fmt: { runs: [], paras: [] } });
+  _ok('plainOf 新形式→text', Ggit_plainOf(newSnap) === 'a\nb');
+  _ok('plainOf 旧プレーン互換', Ggit_plainOf('line1\nline2') === 'line1\nline2');
+  _ok('plainOf 数値風プレーン', Ggit_plainOf('123') === '123');
+  _ok('plainOf JSON風プレーン', Ggit_plainOf('{"a":1}') === '{"a":1}');
+}
+
+/**
+ * payload パイプライン（makePayload/materialize）が書式付きスナップショット文字列でも
+ * round-trip すること、および「テキスト同一・書式のみ差」が別スナップショットになることを確認。
+ */
+function _test_snapshotFormatString() {
+  var store = { version: 1, objects: {}, branches: {} };
+  var branch = 't.fmt';
+  function commit(parent, snap) {
+    var ts = '2026-01-01T00:00:00+09:00';
+    var id = Ggit_commitId(store, branch, parent, ts + snap, snap);
+    store.objects[id] = {
+      id: id, branch: branch, parent: parent, parent2: null,
+      message: 'm', author: 'x', timestamp: ts,
+      payload: Ggit_makePayload(store, parent, snap)
+    };
+    return id;
+  }
+  var snapA = JSON.stringify({ v: 1, text: 'hello\nworld', fmt: { runs: [{ s: 0, e: 4, a: { BOLD: true } }], paras: [{ i: 0, a: {} }] } });
+  var snapB = JSON.stringify({ v: 1, text: 'hello\nworld', fmt: { runs: [{ s: 0, e: 4, a: { ITALIC: true } }], paras: [{ i: 0, a: {} }] } });
+
+  var id1 = commit(null, snapA);
+  var id2 = commit(id1, snapB);
+  _ok('snapshot文字列 round-trip A', Ggit_materialize(store, id1) === snapA);
+  _ok('snapshot文字列 round-trip B', Ggit_materialize(store, id2) === snapB);
+  _ok('書式のみ差で別スナップショット', snapA !== snapB);
+  _ok('plainOf は同一テキスト', Ggit_plainOf(snapA) === Ggit_plainOf(snapB));
+}
+
 function _test_mergeNoConflict() {
   var base = Ggit_splitLines('l1\nl2\nl3\nl4\nl5');
   var ours = Ggit_splitLines('l1\nOURS2\nl3\nl4\nl5');
@@ -2943,6 +3376,100 @@ function _test_mergeConflict() {
     Ggit_splitLines('x\nYOURS\nz'));
   _ok('merge 競合検出', m.conflict === true);
   _ok('merge 競合マーカー', m.text.indexOf('<<<<<<<') >= 0 && m.text.indexOf('>>>>>>>') >= 0);
+}
+
+/**
+ * preview / restore のデータ経路（Ggit_materialize）が各コミット本文を復元することを確認。
+ * Ggit_previewCommit / Ggit_restoreCommit はこの結果をそのままタブへ書く。
+ */
+function _test_restoreMaterialize() {
+  var store = { version: 1, objects: {}, branches: {} };
+  var branch = 't.restore';
+  var texts = ['v1\nbody', 'v1\nbody\nmore', 'v1-CHANGED\nbody\nmore'];
+  var ids = [];
+  var parent = null;
+  for (var i = 0; i < texts.length; i++) {
+    var ts = '2026-01-01T00:00:00+09:00';
+    var id = Ggit_commitId(store, branch, parent, ts + texts[i], texts[i]);
+    store.objects[id] = {
+      id: id, branch: branch, parent: parent, parent2: null,
+      message: 'm', author: 'x', timestamp: ts,
+      payload: Ggit_makePayload(store, parent, texts[i])
+    };
+    ids.push(id);
+    parent = id;
+  }
+  // 任意の過去コミットを「復元元」として正しい本文を取り出せること。
+  _ok('restore: 旧版本文を復元', Ggit_materialize(store, ids[0]) === texts[0]);
+  _ok('restore: 中間版本文を復元', Ggit_materialize(store, ids[1]) === texts[1]);
+  _ok('restore: 最新版本文を復元', Ggit_materialize(store, ids[2]) === texts[2]);
+}
+
+/**
+ * Ggit_tabBodyEndIndex_ が Docs.Documents.get レスポンス（モック）から、
+ * トップ階層タブ・子タブそれぞれの本文末尾 endIndex を返すことを確認。
+ */
+function _test_tabBodyEndIndex() {
+  var res = {
+    tabs: [
+      { tabId: 't.parent',
+        documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 42 }] } },
+        childTabs: [
+          { tabId: 't.child',
+            documentTab: { body: { content: [{ endIndex: 1 }, { endIndex: 7 }] } } }
+        ] }
+    ]
+  };
+  _ok('tabBodyEndIndex: トップ階層', Ggit_tabBodyEndIndex_(res, 't.parent') === 42);
+  _ok('tabBodyEndIndex: 子タブ', Ggit_tabBodyEndIndex_(res, 't.child') === 7);
+}
+
+/**
+ * Log のプレビュー差分は A=コミット, B=作業中。作業中で行を追加したとき、
+ * 着色HTMLに挿入（ins）スパンが現れることを確認。
+ */
+function _test_diffDirection() {
+  var committed = 'l1\nl2';
+  var working = 'l1\nl2\nl3-added';
+  var html = Ggit_diffHtml(committed, working);
+  _ok('diff方向: 作業中の追加が ins として現れる', html.indexOf('<ins') >= 0);
+}
+
+/**
+ * Ggit_pickStore の採用ロジック（純粋関数）。
+ * 巻き戻し検知＝backup.gen > tab.gen で backup を採用することを中心に各分岐を検証。
+ */
+function _test_pickStore() {
+  var tab = { version: 1, gen: 2, objects: { a: 1 }, branches: {} };
+  var bk5 = { version: 1, gen: 5, objects: { a: 1, b: 1 }, branches: {} };
+  var bk1 = { version: 1, gen: 1, objects: {}, branches: {} };
+
+  _ok('pickStore: 巻き戻し検知で backup 採用', Ggit_pickStore(tab, bk5) === bk5);
+  _ok('pickStore: タブが新しければ tab 採用', Ggit_pickStore(tab, bk1) === tab);
+  _ok('pickStore: 同点はタブ優先', Ggit_pickStore({ gen: 3 }, { gen: 3 }).gen === 3 &&
+    Ggit_pickStore(tab, { gen: 2, objects: {}, branches: {} }) === tab);
+  _ok('pickStore: backup 欠落で tab 採用', Ggit_pickStore(tab, null) === tab);
+  _ok('pickStore: tab 欠落で backup 採用', Ggit_pickStore(null, bk5) === bk5);
+  _ok('pickStore: 両方欠落で空ストア', Ggit_pickStore(null, null).gen === 0);
+}
+
+/**
+ * バックアップのチャンク分割→結合が原本一致すること（純粋関数）。
+ * gzip 圧縮の往復は GAS ランタイムが必要なため別途（_test_snapshotRoundTrip 等）に委ね、
+ * ここではチャンク化（Ggit_chunk）の分割/結合の正しさのみを検証する。
+ */
+function _test_backupChunkRoundTrip() {
+  var big = '';
+  for (var i = 0; i < 5000; i++) big += (i % 10);
+  var chunks = Ggit_chunk(big, 8000);
+  _ok('chunk: 分割数が想定どおり', chunks.length === 1);
+  _ok('chunk: 結合で原本一致(小)', chunks.join('') === big);
+
+  var chunks2 = Ggit_chunk(big, 700);
+  _ok('chunk: 複数分割', chunks2.length === Math.ceil(big.length / 700));
+  _ok('chunk: 各チャンクが上限以下', chunks2.every(function (c) { return c.length <= 700; }));
+  _ok('chunk: 結合で原本一致(分割)', chunks2.join('') === big);
+  _ok('chunk: 空文字は空配列', Ggit_chunk('', 700).length === 0);
 }
 
 function _test_lca() {
@@ -2969,9 +3496,13 @@ function _test_lca() {
 function onOpen() {
   DocumentApp.getUi()
     .createMenu('ggit')
+    .addItem('Setup / 権限付与', 'ggitUI_setup')
+    .addSeparator()
     .addItem('Commit…', 'ggitUI_commit')
     .addItem('Log', 'ggitUI_log')
     .addItem('Diff…', 'ggitUI_diff')
+    .addSeparator()
+    .addItem('整合性チェック / 復旧', 'ggitUI_reconcile')
     .addSeparator()
     .addItem('Branch…', 'ggitUI_branch')
     .addItem('Checkout…', 'ggitUI_checkout')
@@ -3026,6 +3557,22 @@ function Ggit_uiListBranches(excludeActiveTabId) {
 
 /* ===================== メニューハンドラ ===================== */
 
+function ggitUI_setup() {
+  var ui = DocumentApp.getUi();
+  try {
+    var info = Ggit_authorize();
+    ui.alert('ggit setup',
+      '初期化が完了しました。\n' +
+      'ドキュメント: ' + info.title + '\n' +
+      'タブ数: ' + info.tabCount + '\n\n' +
+      'これで Commit などの操作が利用できます。\n' +
+      '※ 権限承認の直後はGASの仕様により最初の操作がキャンセルされることがあります。' +
+      'その場合は同じ操作をもう一度実行してください。', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit setup', '初期化中にエラー: ' + e.message, ui.ButtonSet.OK);
+  }
+}
+
 function ggitUI_commit() {
   var ui = DocumentApp.getUi();
   var res = ui.prompt('ggit commit', 'コミットメッセージを入力してください:', ui.ButtonSet.OK_CANCEL);
@@ -3040,27 +3587,94 @@ function ggitUI_commit() {
   }
 }
 
+/** 指定コミットの本文全文（プレーン）を返す（プレビュー用）。 */
+function Ggit_previewCommit(id) {
+  // materialize は書式付きスナップショット文字列を返すため、plainOf で本文を射影する。
+  return Ggit_plainOf(Ggit_materialize(Ggit_storeLoad(), id));
+}
+
+/** 指定コミット本文と現在の作業本文（アクティブタブ）の差分HTML（A=コミット, B=作業中）。 */
+function Ggit_diffCommitVsWorkingHtml(id) {
+  var doc = DocumentApp.getActiveDocument();
+  var working = Ggit_tabText(doc.getActiveTab());
+  // diff はプレーンテキスト対象（設計仕様書 §7.3）。スナップショットから text を射影する。
+  var committed = Ggit_plainOf(Ggit_materialize(Ggit_storeLoad(doc), id));
+  return Ggit_diffHtml(committed, working);
+}
+
+/**
+ * 指定コミットの内容をアクティブタブの作業本文へ復元する（自動コミットしない）。
+ * jj の working-copy モデルに合わせ、記録はユーザの明示 commit に委ねる。
+ * テキスト＋書式を Ggit_restoreTab で書き戻す。アクティブタブ＝単一インスタンスのため Docs API は不要。
+ */
+function Ggit_restoreCommit(id) {
+  var doc = DocumentApp.getActiveDocument();
+  var tab = doc.getActiveTab();
+  var meta = Ggit_metaTab(doc);
+  if (meta && tab.getId() === meta.getId()) {
+    throw new Error('.vcs メタタブには復元できません。対象タブを選択してください。');
+  }
+  var store = Ggit_storeLoad(doc);
+  if (!store.objects[id]) throw new Error('コミットが見つかりません: ' + id);
+  Ggit_restoreTab(tab, Ggit_materialize(store, id));
+  return { restored: id, tabTitle: tab.getTitle() };
+}
+
 function ggitUI_log() {
   var commits = Ggit_uiListCommits();
-  var rows;
   if (!commits.length) {
-    rows = '<tr><td colspan="3" style="color:#888">コミットがありません。</td></tr>';
-  } else {
-    rows = commits.map(function (c) {
-      return '<tr>' +
-        '<td style="font-family:monospace;color:#1a73e8;white-space:nowrap">' + Ggit_esc(c.id) + '</td>' +
-        '<td>' + Ggit_esc(c.message) + '</td>' +
-        '<td style="color:#888;white-space:nowrap">' + Ggit_esc(c.timestamp) + '</td>' +
-        '</tr>';
-    }).join('');
+    Ggit_showModal(
+      '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:8px;color:#888">コミットがありません。</div>',
+      'ggit log', 480, 200);
+    return;
   }
+  var rows = commits.map(function (c) {
+    return '<div class="row" data-id="' + Ggit_esc(c.id) + '" onclick="sel(this)">' +
+      '<span style="font-family:monospace;color:#1a73e8">' + Ggit_esc(c.id) + '</span> ' +
+      Ggit_esc(c.message) +
+      '<div style="color:#888;font-size:11px">' + Ggit_esc(c.timestamp) + '</div></div>';
+  }).join('');
+
   var html =
-    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;padding:4px">' +
-    '<table style="border-collapse:collapse;width:100%">' +
-    '<thead><tr style="text-align:left;border-bottom:1px solid #ddd">' +
-    '<th>id</th><th>message</th><th>timestamp</th></tr></thead>' +
-    '<tbody>' + rows + '</tbody></table></div>';
-  Ggit_showModal(html, 'ggit log', 640, 480);
+    '<div style="font:13px/1.5 Roboto,Arial,sans-serif;display:flex;height:470px">' +
+    '<div style="width:38%;overflow:auto;border-right:1px solid #ddd">' + rows + '</div>' +
+    '<div style="flex:1;display:flex;flex-direction:column;padding:0 8px;min-width:0">' +
+    '<div style="margin:6px 0">' +
+    '<label><input type="radio" name="mode" value="content" checked onclick="render()">内容</label> ' +
+    '<label><input type="radio" name="mode" value="diff" onclick="render()">作業中との差分</label> ' +
+    '<button id="restore" onclick="restore()" disabled>この版に戻す</button>' +
+    '<span id="msg" style="color:#188038;margin-left:8px"></span></div>' +
+    '<div id="out" style="border:1px solid #ddd;padding:8px;flex:1;overflow:auto;' +
+    'white-space:pre-wrap;font-family:monospace">コミットを選択してください。</div>' +
+    '</div>' +
+    '<style>.row{padding:6px 8px;cursor:pointer;border-bottom:1px solid #eee}' +
+    '.row.on{background:#e8f0fe}</style>' +
+    '<script>' +
+    'var cur=null;' +
+    'function sel(el){' +
+    'var rs=document.querySelectorAll(".row");for(var i=0;i<rs.length;i++)rs[i].className="row";' +
+    'el.className="row on";cur=el.getAttribute("data-id");' +
+    'document.getElementById("restore").disabled=false;' +
+    'document.getElementById("msg").innerText="";render();}' +
+    'function render(){if(!cur)return;' +
+    'var mode=document.querySelector("input[name=mode]:checked").value;' +
+    'var out=document.getElementById("out");out.innerText="読み込み中…";' +
+    'if(mode==="content"){' +
+    'google.script.run.withSuccessHandler(function(t){out.innerText=t;})' +
+    '.withFailureHandler(function(e){out.innerText=e.message;}).Ggit_previewCommit(cur);' +
+    '}else{' +
+    'google.script.run.withSuccessHandler(function(h){out.innerHTML=h;})' +
+    '.withFailureHandler(function(e){out.innerText=e.message;}).Ggit_diffCommitVsWorkingHtml(cur);}}' +
+    'function restore(){if(!cur)return;' +
+    'if(!confirm("選択した版の内容をアクティブタブの本文に書き戻します。未コミットの編集は失われます。よろしいですか？"))return;' +
+    'document.getElementById("restore").disabled=true;' +
+    'google.script.run.withSuccessHandler(function(r){' +
+    'document.getElementById("msg").innerText="復元しました（"+r.restored+"）。必要なら Commit で記録してください。";' +
+    'document.getElementById("restore").disabled=false;})' +
+    '.withFailureHandler(function(e){document.getElementById("msg").innerText=e.message;' +
+    'document.getElementById("restore").disabled=false;}).Ggit_restoreCommit(cur);}' +
+    '</script></div>';
+  Ggit_showModal(html, 'ggit log', 820, 520);
 }
 
 function ggitUI_diff() {
@@ -3099,6 +3713,56 @@ function ggitUI_diff() {
     'run();' +
     '</script></div>';
   Ggit_showModal(html, 'ggit diff', 720, 540);
+}
+
+/**
+ * 整合性チェック / 復旧。
+ * `.vcs` タブと PropertiesService バックアップの世代（gen）を比較し、ネイティブ版復元による
+ * 巻き戻し（backup.gen > tab.gen）を検知したらバックアップからタブを即時ヒールする。
+ * バックアップ使用量（~500KB 上限への余裕）も表示する。
+ */
+function ggitUI_reconcile() {
+  var ui = DocumentApp.getUi();
+  try {
+    var doc = DocumentApp.getActiveDocument();
+    var tabStore = Ggit_tabStoreLoad(doc);
+    var backupStore = Ggit_backupLoad(doc);
+    var tabGen = tabStore ? (tabStore.gen || 0) : null;
+    var bkGen = backupStore ? (backupStore.gen || 0) : null;
+    var bytes = Ggit_backupBytes(doc);
+    var limit = 500 * 1024;
+
+    var lines = [];
+    lines.push('.vcs タブ世代 (gen): ' + (tabGen == null ? '（メタタブ無し）' : tabGen));
+    lines.push('バックアップ世代 (gen): ' + (bkGen == null ? '（バックアップ無し）' : bkGen));
+    lines.push('バックアップ使用量: 約 ' + Math.round(bytes / 1024) + ' KB / 上限 約 500 KB');
+
+    if (backupStore && (tabGen == null || bkGen > tabGen)) {
+      // 巻き戻し検知 → タブをバックアップからヒール（世代は据え置きで書き戻す）。
+      Ggit_setTabTextApi(doc.getId(), Ggit_reconcileTabId_(doc), JSON.stringify(backupStore));
+      lines.push('');
+      lines.push('⚠ ネイティブ版復元による巻き戻しを検出し、履歴を復旧しました' +
+        '（gen ' + (tabGen == null ? '無し' : tabGen) + ' → ' + bkGen + '）。');
+    } else {
+      lines.push('');
+      lines.push('整合しています（巻き戻しは検出されませんでした）。');
+    }
+    if (bytes > limit * 0.8) {
+      lines.push('');
+      lines.push('※ バックアップ使用量が上限に近づいています。大規模履歴では Drive サイドカーへの' +
+        '移行を検討してください（設計仕様書 §5.2 案C）。');
+    }
+    ui.alert('ggit 整合性チェック', lines.join('\n'), ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit 整合性チェック', 'エラー: ' + e.message, ui.ButtonSet.OK);
+  }
+}
+
+/** ヒール用にメタタブIDを得る（無ければ生成して返す）。 */
+function Ggit_reconcileTabId_(doc) {
+  var t = Ggit_metaTab(doc);
+  if (!t) t = Ggit_createTab(doc, GGIT_META_TITLE);
+  return t.getId();
 }
 
 function ggitUI_branch() {
@@ -3185,9 +3849,12 @@ function ggitUI_about() {
     '<div style="font:13px/1.6 Roboto,Arial,sans-serif;padding:8px">' +
     '<b>ggit</b> — Googleドキュメント単体で動くGit風バージョン管理ツール<br>' +
     'タブをブランチに見立て、commit / log / diff / branch / checkout / merge を提供します。<br><br>' +
-    'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。' +
+    'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存され、' +
+    'PropertiesService にもバックアップされます（Google ネイティブ版復元で巻き戻っても' +
+    '「整合性チェック / 復旧」で履歴を復旧できます）。' +
     '<code>.vcs</code> タブは手動編集しないでください。<br>' +
-    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3）。' +
+    'commit は本文の書式（文字・段落書式）も記録し、branch では書式ごと復元します。' +
+    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +
     '</div>';
   Ggit_showModal(html, 'About ggit', 480, 220);
 }
