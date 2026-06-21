@@ -13,6 +13,7 @@
   },
   "oauthScopes": [
     "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/script.container.ui"
+    "https://www.googleapis.com/auth/script.container.ui",
+    "https://www.googleapis.com/auth/script.scriptapp"
   ]
 }

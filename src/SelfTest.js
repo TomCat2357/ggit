@@ -21,6 +21,10 @@ function _test_all() {
   _test_diffDirection();
   _test_pickStore();
   _test_backupChunkRoundTrip();
+  _test_logRoundTrip();
+  _test_logAppendReplay();
+  _test_logLegacyParse();
+  _test_logCorruptLineSkip();
   Logger.log('--- self-test 完了 ---');
 }
 
@@ -226,6 +230,73 @@ function _test_backupChunkRoundTrip() {
   _ok('chunk: 各チャンクが上限以下', chunks2.every(function (c) { return c.length <= 700; }));
   _ok('chunk: 結合で原本一致(分割)', chunks2.join('') === big);
   _ok('chunk: 空文字は空配列', Ggit_chunk('', 700).length === 0);
+}
+
+/** 純粋関数: JSONL ログの清書→解析ラウンドトリップ（オブジェクト・branches・gen の一致）。 */
+function _test_logRoundTrip() {
+  var store = {
+    version: 1, gen: 7,
+    objects: {
+      a1b2c3d: { id: 'a1b2c3d', parent: null, message: 'm1', payload: { type: 'full', data: 'X' } },
+      e4f5a6b: { id: 'e4f5a6b', parent: 'a1b2c3d', message: 'm2', payload: { type: 'delta', data: 'Y' } }
+    },
+    branches: { 't.1': { head: 'e4f5a6b', name: 'Main' } }
+  };
+  var text = Ggit_logRewrite_(store);
+  var back = Ggit_logParse_(text);
+  _ok('log: 新形式として解析される', back.__logok === true);
+  _ok('log: gen 一致', back.gen === 7);
+  _ok('log: meta 行は1つ', back.__metaSeen === 1);
+  _ok('log: branches 一致', back.branches['t.1'].head === 'e4f5a6b');
+  _ok('log: オブジェクト2件復元', back.objects.a1b2c3d && back.objects.e4f5a6b &&
+    back.objects.e4f5a6b.payload.data === 'Y');
+}
+
+/** 純粋関数: 清書後に追記した行をリプレイし、最後の meta を採用すること。 */
+function _test_logAppendReplay() {
+  var store = {
+    version: 1, gen: 1,
+    objects: { a1b2c3d: { id: 'a1b2c3d', parent: null, payload: { type: 'full', data: 'X' } } },
+    branches: { 't.1': { head: 'a1b2c3d', name: 'Main' } }
+  };
+  var text = Ggit_logRewrite_(store);
+
+  // 2回目の保存を追記でシミュレート（新オブジェクト e4f5a6b、gen=2）。
+  store.gen = 2;
+  store.objects.e4f5a6b = { id: 'e4f5a6b', parent: 'a1b2c3d', payload: { type: 'delta', data: 'Y' } };
+  store.branches['t.1'] = { head: 'e4f5a6b', name: 'Main' };
+  text = text + Ggit_logAppend_(store, ['e4f5a6b']);
+
+  var back = Ggit_logParse_(text);
+  _ok('logAppend: 最後の meta(gen=2) を採用', back.gen === 2);
+  _ok('logAppend: meta 行は2つ', back.__metaSeen === 2);
+  _ok('logAppend: HEAD 更新が反映', back.branches['t.1'].head === 'e4f5a6b');
+  _ok('logAppend: 追記オブジェクトが復元', !!back.objects.e4f5a6b);
+}
+
+/** 純粋関数: 旧形式（単一 JSON ストア）を後方互換で読めること。 */
+function _test_logLegacyParse() {
+  var legacy = JSON.stringify({
+    version: 1, gen: 3, objects: { z: { id: 'z' } }, branches: { 't.9': { head: 'z', name: 'B' } }
+  });
+  var back = Ggit_logParse_(legacy);
+  _ok('legacy: 旧形式として解析される', back.__logok === false);
+  _ok('legacy: gen 一致', back.gen === 3);
+  _ok('legacy: オブジェクト復元', !!back.objects.z);
+}
+
+/** 純粋関数: ログ末尾の破損行（版復元の切れ等）はスキップし、直前の有効状態を採ること。 */
+function _test_logCorruptLineSkip() {
+  var store = {
+    version: 1, gen: 4,
+    objects: { a1b2c3d: { id: 'a1b2c3d', parent: null, payload: { type: 'full', data: 'X' } } },
+    branches: { 't.1': { head: 'a1b2c3d', name: 'Main' } }
+  };
+  var text = Ggit_logRewrite_(store) + '\n{"o":"broke","v":{partial'; // 末尾切れ
+  var back = Ggit_logParse_(text);
+  _ok('corrupt: 破損行を無視して解析成功', back.gen === 4);
+  _ok('corrupt: 破損オブジェクトは未追加', !back.objects.broke);
+  _ok('corrupt: 健全オブジェクトは残る', !!back.objects.a1b2c3d);
 }
 
 function _test_lca() {

@@ -17,6 +17,7 @@ function onOpen() {
     .addItem('Diff…', 'ggitUI_diff')
     .addSeparator()
     .addItem('整合性チェック / 復旧', 'ggitUI_reconcile')
+    .addItem('圧縮 / 清書 (Compact)', 'ggitUI_compact')
     .addSeparator()
     .addItem('Branch…', 'ggitUI_branch')
     .addItem('Checkout…', 'ggitUI_checkout')
@@ -80,6 +81,9 @@ function ggitUI_setup() {
       'ドキュメント: ' + info.title + '\n' +
       'タブ数: ' + info.tabCount + '\n\n' +
       'これで Commit などの操作が利用できます。\n' +
+      '※ バックアップ（PropertiesService）はバックグラウンドで非同期に実行され、' +
+      '反映まで数十秒かかることがあります（その間は次の操作が自動で先に完了させます）。\n' +
+      '※ トリガ作成の権限が増えたため、再度の権限承認が求められることがあります。\n' +
       '※ 権限承認の直後はGASの仕様により最初の操作がキャンセルされることがあります。' +
       'その場合は同じ操作をもう一度実行してください。', ui.ButtonSet.OK);
   } catch (e) {
@@ -123,6 +127,7 @@ function Ggit_diffCommitVsWorkingHtml(id) {
  */
 function Ggit_restoreCommit(id) {
   var doc = DocumentApp.getActiveDocument();
+  Ggit_ensureBackupFresh_(doc); // 保留中の非同期バックアップを先に収束（dirty ガード）
   var tab = doc.getActiveTab();
   var meta = Ggit_metaTab(doc);
   if (meta && tab.getId() === meta.getId()) {
@@ -231,40 +236,45 @@ function ggitUI_diff() {
 
 /**
  * 整合性チェック / 復旧。
- * `.vcs` タブと PropertiesService バックアップの世代（gen）を比較し、ネイティブ版復元による
- * 巻き戻し（backup.gen > tab.gen）を検知したらバックアップからタブを即時ヒールする。
- * バックアップ使用量（~500KB 上限への余裕）も表示する。
+ * `.vcs` タブと PropertiesService バックアップを世代（gen）で収束させる。ネイティブ版復元による
+ * 巻き戻し（backup.gen > tab.gen）を検知したらバックアップからタブをヒールし、保留中の非同期
+ * バックアップがあれば完了させる。バックアップ使用量（~500KB 上限への余裕）も表示する。
  */
 function ggitUI_reconcile() {
   var ui = DocumentApp.getUi();
   try {
     var doc = DocumentApp.getActiveDocument();
-    var tabStore = Ggit_tabStoreLoad(doc);
-    var backupStore = Ggit_backupLoad(doc);
-    var tabGen = tabStore ? (tabStore.gen || 0) : null;
-    var bkGen = backupStore ? (backupStore.gen || 0) : null;
+    var dirtyBefore = Ggit_isDirty_();
+    var r = Ggit_convergeStores_(doc);
+    Ggit_clearBackupTriggers_();
+
     var bytes = Ggit_backupBytes(doc);
     var limit = 500 * 1024;
+    var err = null;
+    try { err = PropertiesService.getDocumentProperties().getProperty(GGIT_ERR_KEY); } catch (_) {}
 
     var lines = [];
-    lines.push('.vcs タブ世代 (gen): ' + (tabGen == null ? '（メタタブ無し）' : tabGen));
-    lines.push('バックアップ世代 (gen): ' + (bkGen == null ? '（バックアップ無し）' : bkGen));
+    lines.push('.vcs タブ世代 (gen): ' + (r.tabGen == null ? '（メタタブ無し）' : r.tabGen));
+    lines.push('バックアップ世代 (gen): ' + (r.bkGen == null ? '（バックアップ無し）' : r.bkGen));
     lines.push('バックアップ使用量: 約 ' + Math.round(bytes / 1024) + ' KB / 上限 約 500 KB');
+    lines.push('');
 
-    if (backupStore && (tabGen == null || bkGen > tabGen)) {
-      // 巻き戻し検知 → タブをバックアップからヒール（世代は据え置きで書き戻す）。
-      Ggit_setTabTextApi(doc.getId(), Ggit_reconcileTabId_(doc), JSON.stringify(backupStore));
-      lines.push('');
+    if (r.healedTab) {
       lines.push('⚠ ネイティブ版復元による巻き戻しを検出し、履歴を復旧しました' +
-        '（gen ' + (tabGen == null ? '無し' : tabGen) + ' → ' + bkGen + '）。');
+        '（gen ' + (r.tabGen == null ? '無し' : r.tabGen) + ' → ' + r.pickGen + '）。');
+    } else if (dirtyBefore) {
+      lines.push('保留中のバックアップを完了しました（gen ' + r.pickGen + '）。');
     } else {
-      lines.push('');
       lines.push('整合しています（巻き戻しは検出されませんでした）。');
+    }
+    if (err) {
+      lines.push('');
+      lines.push('※ 直近のバックアップ警告: ' + err);
     }
     if (bytes > limit * 0.8) {
       lines.push('');
-      lines.push('※ バックアップ使用量が上限に近づいています。大規模履歴では Drive サイドカーへの' +
-        '移行を検討してください（設計仕様書 §5.2 案C）。');
+      lines.push('※ バックアップ使用量が上限に近づいています。「圧縮 / 清書」での清書、または' +
+        ' Drive サイドカーへの移行を検討してください（設計仕様書 §5.2 案C）。');
     }
     ui.alert('ggit 整合性チェック', lines.join('\n'), ui.ButtonSet.OK);
   } catch (e) {
@@ -272,11 +282,24 @@ function ggitUI_reconcile() {
   }
 }
 
-/** ヒール用にメタタブIDを得る（無ければ生成して返す）。 */
-function Ggit_reconcileTabId_(doc) {
-  var t = Ggit_metaTab(doc);
-  if (!t) t = Ggit_createTab(doc, GGIT_META_TITLE);
-  return t.getId();
+/**
+ * 圧縮 / 清書（コンパクション）。
+ * 追記で溜まった `.vcs` ログの古い meta 行と、Properties バックアップの孤立キーを掃除し、
+ * 現状に即した最小形（単一 meta の JSONL ＋ 現行オブジェクトのみ）へ書き直す。
+ */
+function ggitUI_compact() {
+  var ui = DocumentApp.getUi();
+  try {
+    var r = Ggit_compact();
+    ui.alert('ggit 圧縮 / 清書',
+      '.vcs タブと Properties バックアップを現状に即して清書しました。\n' +
+      '世代 (gen): ' + r.gen + '\n' +
+      'オブジェクト数: ' + r.objects + '\n' +
+      'バックアップ使用量: 約 ' + Math.round(r.bytes / 1024) + ' KB / 上限 約 500 KB',
+      ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('ggit 圧縮 / 清書', 'エラー: ' + e.message, ui.ButtonSet.OK);
+  }
 }
 
 function ggitUI_branch() {
@@ -363,9 +386,10 @@ function ggitUI_about() {
     '<div style="font:13px/1.6 Roboto,Arial,sans-serif;padding:8px">' +
     '<b>ggit</b> — Googleドキュメント単体で動くGit風バージョン管理ツール<br>' +
     'タブをブランチに見立て、commit / log / diff / branch / checkout / merge を提供します。<br><br>' +
-    'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存され、' +
-    'PropertiesService にもバックアップされます（Google ネイティブ版復元で巻き戻っても' +
-    '「整合性チェック / 復旧」で履歴を復旧できます）。' +
+    'オブジェクトストアは <code>.vcs</code> メタタブに追記型ログ（JSONL）で保存され、' +
+    'PropertiesService にも差分バックアップされます（Google ネイティブ版復元で巻き戻っても' +
+    '「整合性チェック / 復旧」で履歴を復旧できます）。バックアップはバックグラウンドで' +
+    '非同期に走り、溜まったログは「圧縮 / 清書」で最小形に書き直せます。' +
     '<code>.vcs</code> タブは手動編集しないでください。<br>' +
     'commit は本文の書式（文字・段落書式）も記録し、branch では書式ごと復元します。' +
     '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +

@@ -12,6 +12,7 @@
  */
 function Ggit_branch(name) {
   var doc = DocumentApp.getActiveDocument();
+  Ggit_ensureBackupFresh_(doc); // 保留中の非同期バックアップを先に収束（dirty ガード）
   var srcTab = doc.getActiveTab();
   var srcId = srcTab.getId();
 
@@ -36,7 +37,7 @@ function Ggit_branch(name) {
   Ggit_restoreTab(newTab, srcSnap);
 
   store.branches[newTabId] = { head: br.head, name: name };
-  Ggit_storeSave(doc, store);
+  Ggit_storeSave(doc, store, []); // 新規オブジェクト無し（HEAD を複製するのみ）→ meta 行のみ追記
   return newTabId;
 }
 

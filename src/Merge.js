@@ -161,6 +161,7 @@ function Ggit_findLCA(store, idA, idB) {
  */
 function Ggit_merge(sourceTabId) {
   var doc = DocumentApp.getActiveDocument();
+  Ggit_ensureBackupFresh_(doc); // 保留中の非同期バックアップを先に収束（dirty ガード）
   var curTab = doc.getActiveTab();
   var curTabId = curTab.getId();
   if (curTabId === sourceTabId) {
@@ -212,6 +213,6 @@ function Ggit_merge(sourceTabId) {
     payload: Ggit_makePayload(store, curHead, snap)
   };
   store.branches[curTabId] = { head: id, name: curTab.getTitle() };
-  Ggit_storeSave(doc, store);
+  Ggit_storeSave(doc, store, [id]);
   return { conflict: false, commitId: id, upToDate: false };
 }

@@ -27,6 +27,7 @@ function Ggit_timestamp() {
  */
 function Ggit_commit(message) {
   var doc = DocumentApp.getActiveDocument();
+  Ggit_ensureBackupFresh_(doc); // 保留中の非同期バックアップを先に収束（dirty ガード）
   var tab = doc.getActiveTab();
   var tabId = tab.getId();
 
@@ -60,7 +61,7 @@ function Ggit_commit(message) {
   };
   store.branches[tabId] = { head: id, name: tab.getTitle() };
 
-  Ggit_storeSave(doc, store);
+  Ggit_storeSave(doc, store, [id]);
   return id;
 }
 
