@@ -93,7 +93,7 @@ function Ggit_goto(target) {
   var curSnap = Ggit_serializeTab(tab);
 
   var stashed = false;
-  if (curSnap !== targetSnap) {
+  if (Ggit_plainOf(curSnap) !== Ggit_plainOf(targetSnap)) {
     // 現在の未コミット内容を退避してから対象コミットの内容を復元する。
     stashed = Ggit_stashIfNeeded(
       store, tab, cur, curSnap,

@@ -87,7 +87,7 @@ function Ggit_popStash(stashId) {
   var cur = Ggit_resolveWorking(doc, store);
 
   var stashed = false;
-  if (curSnap !== snap) {
+  if (Ggit_plainOf(curSnap) !== Ggit_plainOf(snap)) {
     stashed = Ggit_stashIfNeeded(store, tab, cur, curSnap, 'pop 前の自動スタッシュ');
     Ggit_restoreTab(tab, snap);
   }

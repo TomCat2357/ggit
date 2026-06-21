@@ -99,20 +99,18 @@ function Ggit_materialize(store, id) {
   return text;
 }
 
-/* ===================== 書式付きスナップショット（スコープ①: 記録＋復元） ===================== */
+/* ===================== スナップショット（完全テキストベース） ===================== */
 /*
- * payload に格納する「素材」を、プレーンテキストから構造化 JSON 文字列に拡張する。
- *   { "v":1, "text": <body.getText() と一致する全文>,
- *     "fmt": { "runs":[{s,e,a}], "paras":[{i,a}] } }
- * - text を diff/merge がそのまま射影（Ggit_plainOf）して使うため、プレーン処理は無改変。
- * - fmt を含めて比較することで「テキスト同一・書式のみ変更」を commit が検知できる。
- * - 圧縮/delta/コミットID は文字列処理なので、この JSON 文字列をそのまま流せる（無改修）。
+ * コミットの「素材」は完全テキストベースの JSON 文字列とする（書式は記録しない）。
+ *   { "v":2, "text": <本文の正準テキスト。表は Markdown のパイプ表> }
+ * - text を diff/merge がそのまま射影（Ggit_plainOf）して使う。
+ * - 圧縮/delta/コミットID は文字列処理なので、この JSON 文字列をそのまま流せる。
  *
- * 後方互換: 旧 `.vcs`（payload が生プレーンテキスト）も Ggit_parseSnap / Ggit_plainOf が
- * 透過的に読めるため、既存ドキュメントを壊さない。
+ * 後方互換: 旧 `.vcs`（v:1 の書式付き JSON、または生プレーンテキスト）も Ggit_parseSnap /
+ * Ggit_plainOf が text を透過的に取り出せるため、既存ドキュメントを壊さない（書式は無視）。
  *
- * フィデリティ境界（①）: 文字書式・段落書式のみ対応。表/画像/リストのグリフ・ネストは
- * 非対応（テキストとしては保持されるが書式は復元しない）。設計仕様書 §7.3 に整合。
+ * 完全再現の方針: 書式・表・画像の完全な再現は、各コミットに紐づけて keepForever で固定した
+ * ネイティブ版（Google ドキュメントの変更履歴）の「復元」に委譲する。
  */
 
 /** スナップショット文字列を { v, text, fmt } へ復号。旧プレーン payload は {text:raw} 扱い。 */
@@ -130,134 +128,84 @@ function Ggit_plainOf(s) {
   return Ggit_parseSnap(s).text;
 }
 
-/** オブジェクトに列挙可能キーが1つでもあるか。 */
-function Ggit_hasKeys(o) {
-  for (var k in o) { if (o.hasOwnProperty(k)) return true; }
-  return false;
-}
-
-/** 文字列値の属性名→列挙型のマップ（①で復元対象とする段落系 enum のみ）。 */
-function Ggit_enumFromString(attrKey, name) {
-  var maps = {
-    HEADING: DocumentApp.ParagraphHeading,
-    HORIZONTAL_ALIGNMENT: DocumentApp.HorizontalAlignment
-  };
-  var e = maps[attrKey];
-  if (!e) return null;
-  var v = e[name];
-  return v === undefined ? null : v;
+/** 表セル内テキストを Markdown 表のセル用に正規化（改行→空白、`|` をエスケープ）。 */
+function Ggit_mdCell_(s) {
+  return String(s == null ? '' : s).replace(/\r?\n/g, ' ').replace(/\|/g, '\\|');
 }
 
 /**
- * getAttributes() の戻り値を JSON 安全な形へ正規化する。
- * - null/undefined は捨てる（未設定属性でストアを肥大させない）。
- * - 文字列/数値/真偽はそのまま。
- * - それ以外（列挙型など）は { __enum: <toString> } で名前を保持する。
+ * Table 要素を Markdown のパイプ表（| a | b |）へ変換する。
+ * 1行目をヘッダ、2行目を区切り（| --- | …）、以降をデータ行とする。
+ * 行ごとにセル数が異なる場合は最大列数に空セルで揃える。
+ * フィデリティ境界: ネスト表・結合セルは非対応（セルのテキスト内容のみ）。
  */
-function Ggit_normAttrs(attrs) {
-  var out = {};
-  for (var k in attrs) {
-    if (!attrs.hasOwnProperty(k)) continue;
-    var v = attrs[k];
-    if (v === null || v === undefined) continue;
-    var tv = typeof v;
-    if (tv === 'string' || tv === 'number' || tv === 'boolean') {
-      out[k] = v;
-    } else {
-      out[k] = { __enum: String(v) };
-    }
+function Ggit_tableToMarkdown_(table) {
+  var nRows = table.getNumRows();
+  if (nRows === 0) return '';
+  var grid = [], maxCols = 0, r, c;
+  for (r = 0; r < nRows; r++) {
+    var row = table.getRow(r);
+    var nc = row.getNumCells();
+    if (nc > maxCols) maxCols = nc;
+    var cells = [];
+    for (c = 0; c < nc; c++) cells.push(Ggit_mdCell_(row.getCell(c).getText()));
+    grid.push(cells);
   }
-  return out;
-}
-
-/** 正規化属性を setAttributes() 適用可能な形へ戻す。復元不能な enum は捨てる（①の境界）。 */
-function Ggit_denormAttrs(obj) {
-  var out = {};
-  for (var k in obj) {
-    if (!obj.hasOwnProperty(k)) continue;
-    var v = obj[k];
-    if (v && typeof v === 'object' && v.__enum !== undefined) {
-      var e = Ggit_enumFromString(k, v.__enum);
-      if (e !== null) out[k] = e; // 未対応 enum は適用しない
-    } else {
-      out[k] = v;
-    }
+  if (maxCols === 0) return '';
+  function line(cells) {
+    var out = [];
+    for (var i = 0; i < maxCols; i++) out.push(i < cells.length ? cells[i] : '');
+    return '| ' + out.join(' | ') + ' |';
   }
-  return out;
-}
-
-/** body の段落系要素（Paragraph / ListItem）を本文順で返す。 */
-function Ggit_paraElements(body) {
-  var out = [];
-  var n = body.getNumChildren();
-  for (var i = 0; i < n; i++) {
-    var c = body.getChild(i);
-    var t = c.getType();
-    if (t === DocumentApp.ElementType.PARAGRAPH || t === DocumentApp.ElementType.LIST_ITEM) {
-      out.push(c);
-    }
-  }
-  return out;
+  var sep = [];
+  for (c = 0; c < maxCols; c++) sep.push('---');
+  var lines = [line(grid[0]), '| ' + sep.join(' | ') + ' |'];
+  for (r = 1; r < nRows; r++) lines.push(line(grid[r]));
+  return lines.join('\n');
 }
 
 /**
- * タブ本文を書式付きスナップショット文字列としてシリアライズする。
- * 文字書式は body.editAsText() の属性区間、段落書式は段落系要素の属性として取得する。
+ * body 直下の要素を本文順に走査し、コミット用の正準テキストを組み立てる。
+ *  - 段落 / リスト項目 … その要素テキストを1行として連結（getText 相当）。
+ *  - 表 … Ggit_tableToMarkdown_ で Markdown のパイプ表へ。
+ *  - その他（目次など）… 取得できればテキスト、無ければ空。
+ * getChild は表も文書順で返すため、本文の並びが保たれる。
+ */
+function Ggit_bodyToText_(body) {
+  var n = body.getNumChildren();
+  var parts = [];
+  for (var i = 0; i < n; i++) {
+    var child = body.getChild(i);
+    var t = child.getType();
+    if (t === DocumentApp.ElementType.TABLE) {
+      parts.push(Ggit_tableToMarkdown_(child.asTable()));
+    } else if (t === DocumentApp.ElementType.PARAGRAPH) {
+      parts.push(child.asParagraph().getText());
+    } else if (t === DocumentApp.ElementType.LIST_ITEM) {
+      parts.push(child.asListItem().getText());
+    } else {
+      try { parts.push(child.asText().getText()); } catch (_) { parts.push(''); }
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
+ * タブ本文をコミット用スナップショット文字列としてシリアライズする（完全テキストベース）。
+ * 書式は記録しない。表は Markdown のパイプ表としてテキスト化する（Ggit_bodyToText_）。
+ *   { "v":2, "text": <本文の正準テキスト（表は Markdown）> }
  */
 function Ggit_serializeTab(tab) {
   var body = tab.asDocumentTab().getBody();
-  var text = body.getText();
-
-  var runs = [];
-  if (text.length > 0) {
-    var et = body.editAsText();
-    var idx = et.getTextAttributeIndices();
-    for (var i = 0; i < idx.length; i++) {
-      var s = idx[i];
-      var e = (i + 1 < idx.length) ? idx[i + 1] - 1 : text.length - 1; // 終端は inclusive
-      if (e < s) continue;
-      runs.push({ s: s, e: e, a: Ggit_normAttrs(et.getAttributes(s)) });
-    }
-  }
-
-  var paras = [];
-  var pels = Ggit_paraElements(body);
-  for (var j = 0; j < pels.length; j++) {
-    paras.push({ i: j, a: Ggit_normAttrs(pels[j].getAttributes()) });
-  }
-
-  return JSON.stringify({ v: 1, text: text, fmt: { runs: runs, paras: paras } });
+  return JSON.stringify({ v: 2, text: Ggit_bodyToText_(body) });
 }
 
 /**
- * スナップショット文字列をタブ本文へ復元する（テキスト＋書式）。
- * setText 後に段落属性→文字属性の順で再適用する（段落の NamedStyle が文字属性を
- * 上書きしうるため、文字属性を後に当てて明示書式を優先する）。
+ * スナップショット文字列をタブ本文へ復元する（完全テキストベース）。
+ * 書式は復元しない（旧 v:1 の fmt があっても無視）。表は Markdown テキストとして戻る。
+ * 完全な書式・表の再現は、コミットに紐づく固定ネイティブ版（変更履歴）の「復元」で行う。
  */
 function Ggit_restoreTab(tab, snapStr) {
   var body = tab.asDocumentTab().getBody();
-  var snap = Ggit_parseSnap(snapStr);
-  var text = snap.text;
-  body.setText(text);
-  if (!snap.fmt) return; // 旧プレーン payload はテキストのみ復元。
-
-  var pels = Ggit_paraElements(body);
-  var paras = snap.fmt.paras || [];
-  for (var j = 0; j < paras.length; j++) {
-    var p = paras[j];
-    if (p.i < pels.length) {
-      var pa = Ggit_denormAttrs(p.a);
-      if (Ggit_hasKeys(pa)) pels[p.i].setAttributes(pa);
-    }
-  }
-
-  if (text.length > 0) {
-    var et = body.editAsText();
-    var runs = snap.fmt.runs || [];
-    for (var k = 0; k < runs.length; k++) {
-      var r = runs[k];
-      var ra = Ggit_denormAttrs(r.a);
-      if (Ggit_hasKeys(ra) && r.e >= r.s) et.setAttributes(r.s, r.e, ra);
-    }
-  }
+  body.setText(Ggit_parseSnap(snapStr).text);
 }

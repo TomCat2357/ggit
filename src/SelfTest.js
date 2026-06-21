@@ -13,15 +13,21 @@ function _test_all() {
   _test_snapshotRoundTrip();
   _test_plainOf();
   _test_snapshotFormatString();
+  _test_diffLines();
+  _test_mdTable();
   _test_mergeNoConflict();
   _test_mergeConflict();
   _test_lca();
   _test_migrate();
   _test_graphLines();
+  _test_graphLinesSimplified();
+  _test_ancestorNodes();
+  _test_graphCrossings();
   _test_canMaterialize();
   _test_reachable();
   _test_gcDisconnected();
   _test_abandon();
+  _test_deleteSubtree();
   _test_stashGuard();
   _test_firstNonStashAncestor();
   _test_tabBodyEndIndex();
@@ -120,6 +126,32 @@ function _test_snapshotFormatString() {
   _ok('plainOf は同一テキスト', Ggit_plainOf(snapA) === Ggit_plainOf(snapB));
 }
 
+/** 行ベース差分（Ggit_diffLines）の基本ケース。diff-match-patch 依存のためエディタ実行用。 */
+function _test_diffLines() {
+  var L = Ggit_diffLines('a\nb\nc', 'a\nB\nc').lines;
+  _ok('diffLines 行数', L.length === 4);
+  _ok('diffLines eq先頭', L[0].t === 'eq' && L[0].s === 'a');
+  _ok('diffLines eq末尾', L[L.length - 1].t === 'eq' && L[L.length - 1].s === 'c');
+  var dels = L.filter(function (x) { return x.t === 'del'; });
+  var inss = L.filter(function (x) { return x.t === 'ins'; });
+  _ok('diffLines del=b', dels.length === 1 && dels[0].s === 'b');
+  _ok('diffLines ins=B', inss.length === 1 && inss[0].s === 'B');
+
+  var add = Ggit_diffLines('x', 'x\ny').lines.filter(function (x) { return x.t === 'ins'; });
+  _ok('diffLines 追加行', add.length === 1 && add[0].s === 'y');
+
+  var same = Ggit_diffLines('p\nq', 'p\nq').lines;
+  _ok('diffLines 同一は全eq・空行なし',
+    same.length === 2 && same.every(function (x) { return x.t === 'eq'; }));
+}
+
+/** Markdown 表セルの正規化（Ggit_mdCell_）。純粋関数。 */
+function _test_mdTable() {
+  _ok('mdCell パイプ escape', Ggit_mdCell_('a|b') === 'a\\|b');
+  _ok('mdCell 改行→空白', Ggit_mdCell_('a\nb') === 'a b');
+  _ok('mdCell null→空', Ggit_mdCell_(null) === '');
+}
+
 function _test_mergeNoConflict() {
   var base = Ggit_splitLines('l1\nl2\nl3\nl4\nl5');
   var ours = Ggit_splitLines('l1\nOURS2\nl3\nl4\nl5');
@@ -216,6 +248,39 @@ function _test_graphLines() {
   var ml = gline(merge);
   _ok('graph マージ: sprout 行 |\\ がある', ml.join('\n').indexOf('|\\') >= 0);
   _ok('graph マージ: collapse 行 |/ がある', ml.join('\n').indexOf('|/') >= 0);
+}
+
+/**
+ * Ggit_ancestorNodes（純粋関数, 「祖先グラフ」モード用）: 起点の祖先だけへ絞り込み、マージの第2親側も
+ * 含めること・別枝を含めないこと・位相順を保つこと・絞り込み結果を Ggit_graphLines に渡してもマージ記号が
+ * 出る（整合）こと・起点不在で空配列になることを検証する。
+ */
+function _test_ancestorNodes() {
+  var FULL = { type: 'full', data: 'x' };
+  // A→B, A→D, E が B と D を合流（merge）。F は A から伸びる別枝（E の祖先ではない）。
+  var store = {
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+      D: { id: 'D', parent: 'A', parent2: null, timestamp: '2026-06-03', payload: FULL },
+      E: { id: 'E', parent: 'B', parent2: 'D', timestamp: '2026-06-04', payload: FULL },
+      F: { id: 'F', parent: 'A', parent2: null, timestamp: '2026-06-05', payload: FULL }
+    },
+    working: 'E', bookmarks: {}
+  };
+  var nodes = Ggit_collectNodes(store);
+  function sortedIds(ns) { return ns.map(function (n) { return n.id; }).sort().join(','); }
+  var anc = Ggit_ancestorNodes(nodes, 'E');
+  _ok('ancestorNodes: E の祖先は A,B,D,E（マージの第2親 D を含む）', sortedIds(anc) === 'A,B,D,E');
+  _ok('ancestorNodes: E の祖先でない別枝 F を含まない', sortedIds(anc).indexOf('F') < 0);
+  var order = anc.map(function (n) { return n.id; });
+  _ok('ancestorNodes: 位相順を保持（E が A より前）', order.indexOf('E') < order.indexOf('A'));
+  _ok('ancestorNodes: 位相順を保持（B が A より前）', order.indexOf('B') < order.indexOf('A'));
+  var g = Ggit_graphLines(anc).map(function (r) { return r.graph; }).join('\n');
+  _ok('ancestorNodes→graphLines: マージ sprout |\\ がある', g.indexOf('|\\') >= 0);
+  _ok('ancestorNodes→graphLines: 合流 collapse |/ がある', g.indexOf('|/') >= 0);
+  _ok('ancestorNodes: 起点 null は空配列', Ggit_ancestorNodes(nodes, null).length === 0);
+  _ok('ancestorNodes: 不在IDは空配列', Ggit_ancestorNodes(nodes, 'NOPE').length === 0);
 }
 
 /** Ggit_canMaterialize（純粋関数）: payload 連鎖が full に届くかで復元可否を判定。 */
@@ -492,4 +557,211 @@ function _test_stashGuard() {
 
   // 直前で作ったスタッシュと同一内容 → 作らない（重複防止が維持）。
   _ok('stash 同一スタッシュは重複させない', Ggit_stashIfNeeded(store, null, b, snapC, '退避') === false);
+}
+
+/**
+ * Ggit_subtreeIds / Ggit_deleteSubtreeInStore（純粋関数）: 枝の根本を消すと子孫だけが全部消える
+ * （下方向のみ・上流は刈らない）、main が消える枝（main とその祖先・parent2 のマージ側枝含む）は保護、を確認。
+ */
+function _test_deleteSubtree() {
+  var FULL = { type: 'full', data: 'x' };
+  function mk() {
+    return {
+      version: 3,
+      objects: {
+        A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+        B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+        C: { id: 'C', parent: 'B', parent2: null, timestamp: '2026-06-03', payload: FULL },
+        D: { id: 'D', parent: 'C', parent2: null, timestamp: '2026-06-04', payload: FULL },
+        E: { id: 'E', parent: 'B', parent2: null, timestamp: '2026-06-03', payload: FULL }
+      },
+      working: 'E', bookmarks: { main: 'B' }
+    };
+  }
+
+  // subtree(C) = {C, D}
+  var sub = Ggit_subtreeIds(mk(), 'C');
+  _ok('subtree(C)={C,D}', sub.C && sub.D && !sub.B && !sub.E && !sub.A);
+
+  // delete C（枝の根本）→ C,D（子孫ごと）削除、A/B/E 残存。
+  var s1 = mk();
+  var r1 = Ggit_deleteSubtreeInStore(s1, 'C', Ggit_ancestorSet(s1, s1.bookmarks.main));
+  _ok('delete C: C,D 削除（子孫ごと）', !s1.objects.C && !s1.objects.D);
+  _ok('delete C: A,B,E 残存', !!s1.objects.A && !!s1.objects.B && !!s1.objects.E);
+  _ok('delete C: removed=2件', r1.removed.length === 2);
+
+  // main 保護: B(=main) と A(main 祖先) は削除不可（throw。subtree に main を含む）。
+  var s2 = mk();
+  var threwB = false;
+  try { Ggit_deleteSubtreeInStore(s2, 'B', Ggit_ancestorSet(s2, s2.bookmarks.main)); } catch (e) { threwB = true; }
+  _ok('delete B(=main) は throw', threwB && !!s2.objects.B);
+  var s3 = mk();
+  var threwA = false;
+  try { Ggit_deleteSubtreeInStore(s3, 'A', Ggit_ancestorSet(s3, s3.bookmarks.main)); } catch (e) { threwA = true; }
+  _ok('delete A(main祖先) は throw', threwA && !!s3.objects.A);
+
+  // delete D（葉）→ D のみ削除。上流の C は刈らない（下方向のみ）。A/B/C/E 残存。
+  var s4 = mk();
+  var r4 = Ggit_deleteSubtreeInStore(s4, 'D', Ggit_ancestorSet(s4, s4.bookmarks.main));
+  _ok('delete D: D のみ削除（上流 C は残す）', !s4.objects.D && !!s4.objects.C);
+  _ok('delete D: A,B,C,E 残存', !!s4.objects.A && !!s4.objects.B && !!s4.objects.C && !!s4.objects.E);
+  _ok('delete D: removed=1件', r4.removed.length === 1);
+
+  // 下方向のみの確認: 無名連鎖 A→B→C（ブックマーク無し）で葉 C を削除しても上流 B/A は残る。
+  var s5 = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+      C: { id: 'C', parent: 'B', parent2: null, timestamp: '2026-06-03', payload: FULL }
+    },
+    working: 'A', bookmarks: {}
+  };
+  var r5 = Ggit_deleteSubtreeInStore(s5, 'C', {});
+  _ok('下方向のみ: C を削除しても上流 B,A は残る', !s5.objects.C && !!s5.objects.B && !!s5.objects.A);
+  _ok('下方向のみ: removed=1件', r5.removed.length === 1);
+
+  // マージ側枝の根本も保護される（main = Merge X into Y。parent2=X 経由で main は X の子孫）。
+  // ユーザー事例: 2047ce6(=X) を破棄すると 7802ac1(=MG, main) も消えるため禁止。c2addee(=TOP) は葉で削除可。
+  var sm = {
+    version: 3,
+    objects: {
+      R:   { id: 'R',   parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      Y:   { id: 'Y',   parent: 'R',  parent2: null, timestamp: '2026-06-02', payload: FULL },
+      X:   { id: 'X',   parent: 'R',  parent2: null, timestamp: '2026-06-02', payload: FULL }, // 側枝の根本
+      MG:  { id: 'MG',  parent: 'Y',  parent2: 'X',  timestamp: '2026-06-03', payload: FULL }, // main = Merge X into Y
+      TOP: { id: 'TOP', parent: 'MG', parent2: null, timestamp: '2026-06-04', payload: FULL }  // main の上の葉
+    },
+    working: 'TOP', bookmarks: { main: 'MG' }
+  };
+  var ancM = Ggit_ancestorSet(sm, sm.bookmarks.main);
+  _ok('マージ側枝の根本 X は main 祖先（保護対象）', !!ancM.X);
+  _ok('subtree(X) に main(MG) を含む', Ggit_subtreeIds(sm, 'X').MG === true);
+  var threwX = false;
+  try { Ggit_deleteSubtreeInStore(sm, 'X', ancM); } catch (e) { threwX = true; }
+  _ok('delete X(マージ側枝の根本) は throw（main が消える）', threwX && !!sm.objects.X && !!sm.objects.MG);
+  var rTop = Ggit_deleteSubtreeInStore(sm, 'TOP', ancM);
+  _ok('delete TOP(main の上の葉): TOP のみ削除、main(MG) は残る',
+    !sm.objects.TOP && !!sm.objects.MG && rTop.removed.length === 1);
+}
+
+/**
+ * Ggit_graphLinesSimplified（純粋関数, jj 風「簡略」表示）: 重要コミットだけ残し、退屈な連続を ~ に畳む。
+ * レーン整合（別レーンの退屈行を跨いで集約しない）と、接続行 |/ が残ることを確認。
+ */
+function _test_graphLinesSimplified() {
+  var FULL = { type: 'full', data: 'x' };
+  // 本流 A→B→C→D→E（C,D は退屈）、側枝 B→F→G（F は退屈）。本流を新しめにして位相順を E,D,C,G,F,B,A に。
+  var store = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+      F: { id: 'F', parent: 'B', parent2: null, timestamp: '2026-06-03', payload: FULL },
+      G: { id: 'G', parent: 'F', parent2: null, timestamp: '2026-06-04', payload: FULL },
+      C: { id: 'C', parent: 'B', parent2: null, timestamp: '2026-06-05', payload: FULL },
+      D: { id: 'D', parent: 'C', parent2: null, timestamp: '2026-06-06', payload: FULL },
+      E: { id: 'E', parent: 'D', parent2: null, timestamp: '2026-06-07', payload: FULL }
+    },
+    working: 'E', bookmarks: { main: 'A', feat: 'G' }
+  };
+  var nodes = Ggit_collectNodes(store);
+  var sr = Ggit_graphLinesSimplified(nodes);
+  var ids = sr.filter(function (r) { return r.id; }).map(function (r) { return r.id; });
+  _ok('simplified: 表示は E,G,B,A のみ（C,D,F は省略）',
+    ids.length === 4 && ids.indexOf('C') < 0 && ids.indexOf('D') < 0 && ids.indexOf('F') < 0);
+  var elided = sr.filter(function (r) { return r.elided; });
+  _ok('simplified: 省略行は2本（C,D の run と F）', elided.length === 2);
+  _ok('simplified: 一方は count=2（C,D）', elided.some(function (r) { return r.count === 2; }));
+  _ok('simplified: 他方は count=1（F）', elided.some(function (r) { return r.count === 1; }));
+  _ok('simplified: 省略行に ~ が含まれる', elided.every(function (r) { return r.graph.indexOf('~') >= 0; }));
+  _ok('simplified: collapse |/ は残る',
+    sr.some(function (r) { return r.id === null && !r.elided && r.graph.indexOf('|/') >= 0; }));
+}
+
+/**
+ * 交差最小化（純粋関数）: ブランチ連続（第1親チェーン追従）の順序で各ブランチが安定した単一レーンに
+ * 収まり、別ブランチが交互に挟まって蛇行しないことを検証する。Ggit_collectNodes の順序と
+ * Ggit_graphLines のレーン列（'*' の位置）で交差性を確認する。
+ */
+function _test_graphCrossings() {
+  var FULL = { type: 'full', data: 'x' };
+  function rows(store) { return Ggit_graphLines(Ggit_collectNodes(store)); }
+  function colMap(rs) { var m = {}; rs.forEach(function (r) { if (r.id) m[r.id] = r.graph.indexOf('*'); }); return m; }
+  function countSub(rs, sub) { var n = 0; rs.forEach(function (r) { if (r.graph.indexOf(sub) >= 0) n++; }); return n; }
+
+  // 1) 直線 A→B→C→D: 全コミットが列0、接続行なし。簡略表示で退屈な中間が1本の ~（count=2）に畳まれる。
+  var lin = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+      C: { id: 'C', parent: 'B', parent2: null, timestamp: '2026-06-03', payload: FULL },
+      D: { id: 'D', parent: 'C', parent2: null, timestamp: '2026-06-04', payload: FULL }
+    },
+    working: 'D', bookmarks: { main: 'A' }
+  };
+  var g1 = rows(lin);
+  _ok('交差/直線: 行数4・接続行なし', g1.length === 4 && g1.every(function (r) { return !!r.id; }));
+  _ok('交差/直線: 全コミットが列0', g1.every(function (r) { return r.graph.indexOf('*') === 0; }));
+  var s1 = Ggit_graphLinesSimplified(Ggit_collectNodes(lin)).filter(function (r) { return r.elided; });
+  _ok('交差/直線: 簡略で退屈2件が1本の ~', s1.length === 1 && s1[0].count === 2 && s1[0].graph.indexOf('~') >= 0);
+
+  // 2) 分岐＋マージ（A→B, A→D, E=merge(B,D)）: 本流 E,B,A は同一列、側枝 D は別列。sprout |\ と collapse |/ が出る。
+  var mrg = {
+    version: 3,
+    objects: {
+      A: { id: 'A', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      B: { id: 'B', parent: 'A', parent2: null, timestamp: '2026-06-02', payload: FULL },
+      D: { id: 'D', parent: 'A', parent2: null, timestamp: '2026-06-03', payload: FULL },
+      E: { id: 'E', parent: 'B', parent2: 'D', timestamp: '2026-06-04', payload: FULL }
+    },
+    working: 'E', bookmarks: {}
+  };
+  var g2 = rows(mrg), c2 = colMap(g2);
+  _ok('交差/マージ: 本流 E,B,A は同一列0', c2.E === 0 && c2.B === 0 && c2.A === 0);
+  _ok('交差/マージ: 側枝 D は別列(>0)', c2.D > 0);
+  var j2 = g2.map(function (r) { return r.graph; }).join('\n');
+  _ok('交差/マージ: sprout |\\ と collapse |/ がある', j2.indexOf('|\\') >= 0 && j2.indexOf('|/') >= 0);
+
+  // 3) 時刻が交互の2ブランチ（中核ケース）: R を根に branch1 P1→P2、branch2 Q1→Q2。各ブランチが連続出力され、
+  //    それぞれ単一の列に収まる（蛇行しない）。根の collapse 以外に '_' 接続が出ない。
+  var two = {
+    version: 3,
+    objects: {
+      R:  { id: 'R',  parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      P1: { id: 'P1', parent: 'R',  parent2: null, timestamp: '2026-06-02', payload: FULL },
+      Q1: { id: 'Q1', parent: 'R',  parent2: null, timestamp: '2026-06-03', payload: FULL },
+      P2: { id: 'P2', parent: 'P1', parent2: null, timestamp: '2026-06-04', payload: FULL },
+      Q2: { id: 'Q2', parent: 'Q1', parent2: null, timestamp: '2026-06-05', payload: FULL }
+    },
+    working: 'Q2', bookmarks: { main: 'R' }
+  };
+  var ord = Ggit_collectNodes(two).map(function (n) { return n.id; });
+  function idx(id) { return ord.indexOf(id); }
+  _ok('交差/2枝: branch1(P) が連続出力', idx('P1') - idx('P2') === 1);
+  _ok('交差/2枝: branch2(Q) が連続出力', idx('Q1') - idx('Q2') === 1);
+  var g3 = rows(two), c3 = colMap(g3);
+  _ok('交差/2枝: 各ブランチが単一列', c3.P1 === c3.P2 && c3.Q1 === c3.Q2);
+  _ok('交差/2枝: 2ブランチは別列', c3.P1 !== c3.Q1);
+  _ok('交差/2枝: 根の collapse 以外に _ 接続なし', g3.every(function (r) { return r.graph.indexOf('_') < 0; }));
+
+  // 4) クロスマージ（R; X=親R; Y=親R; M=merge(X,Y)）: sprout/collapse は各1、マージ後は安定列へ戻る、
+  //    最大行幅 <= 2*2-1=3（幻の3レーンが出ない）。
+  var cross = {
+    version: 3,
+    objects: {
+      R: { id: 'R', parent: null, parent2: null, timestamp: '2026-06-01', payload: FULL },
+      X: { id: 'X', parent: 'R',  parent2: null, timestamp: '2026-06-02', payload: FULL },
+      Y: { id: 'Y', parent: 'R',  parent2: null, timestamp: '2026-06-03', payload: FULL },
+      M: { id: 'M', parent: 'X',  parent2: 'Y',  timestamp: '2026-06-04', payload: FULL }
+    },
+    working: 'M', bookmarks: { main: 'R' }
+  };
+  var g4 = rows(cross), c4 = colMap(g4);
+  _ok('交差/クロス: sprout |\\ が1本', countSub(g4, '|\\') === 1);
+  _ok('交差/クロス: collapse |/ が1本', countSub(g4, '|/') === 1);
+  var maxw = 0; g4.forEach(function (r) { if (r.graph.length > maxw) maxw = r.graph.length; });
+  _ok('交差/クロス: 最大幅<=3（幻の3レーンなし）', maxw <= 3);
+  _ok('交差/クロス: マージ後は安定列（M,X,R 同列）', c4.M === c4.X && c4.X === c4.R);
 }

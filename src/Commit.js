@@ -58,6 +58,24 @@ function Ggit_timestamp() {
 }
 
 /**
+ * ドキュメントの最新 Drive リビジョンを keepForever で固定し、{ id, time } を返す。
+ * コミットは完全テキストベースなので、書式・表・画像の完全な再現はこの固定版（Google
+ * ドキュメントの変更履歴）の「復元」に委譲する。keepForever 化は best-effort（保持上限
+ * 超過などで失敗しても無視）。リビジョンが取得できなければ null。
+ * 要: Drive 拡張サービス（v3）と drive スコープ。
+ */
+function Ggit_pinHeadRevision_(docId) {
+  var list = Drive.Revisions.list(docId, { fields: 'revisions(id,modifiedTime)' });
+  var revs = (list && list.revisions) || [];
+  if (!revs.length) return null;
+  var head = revs[revs.length - 1]; // 昇順の末尾＝最新
+  try {
+    Drive.Revisions.update({ keepForever: true }, docId, head.id);
+  } catch (_) {}
+  return { id: head.id, time: head.modifiedTime || '' };
+}
+
+/**
  * アクティブタブ本文をコミットする。コミットIDを返す。
  * 変更が無い（前回コミットと同一本文）場合は例外を投げる。
  */
@@ -71,7 +89,7 @@ function Ggit_commit(message) {
     throw new Error('.vcs メタタブはコミットできません。対象のタブを選択してください。');
   }
 
-  var snap = Ggit_serializeTab(tab); // テキスト＋書式の構造化スナップショット
+  var snap = Ggit_serializeTab(tab); // 完全テキストベースのスナップショット（表は Markdown）
   var store = Ggit_storeLoad(doc);
 
   // 親＝現在地 working。初回（未確立）は parent=null。
@@ -84,7 +102,7 @@ function Ggit_commit(message) {
     parent = Ggit_firstNonStashAncestor_(store, parent);
   }
 
-  if (parent && Ggit_materialize(store, parent) === snap) {
+  if (parent && Ggit_plainOf(Ggit_materialize(store, parent)) === Ggit_plainOf(snap)) {
     throw new Error('変更がありません（前回コミットと同一の内容です）。');
   }
 
@@ -101,6 +119,15 @@ function Ggit_commit(message) {
     timestamp: ts,
     payload: payload
   };
+
+  // このコミットに最寄りのネイティブ版（Drive リビジョン）を keepForever で固定し、
+  // 完全な書式・表・画像の再現を後から「変更履歴」から行えるようにする
+  // （best-effort: Drive 不調でも commit は失敗させない）。
+  try {
+    var rev = Ggit_pinHeadRevision_(doc.getId());
+    if (rev) store.objects[id].revision = rev;
+  } catch (_) {}
+
   store.working = id; // 現在地 @ のみ前進（ブックマークは動かさない＝jj）
 
   Ggit_storeSave(doc, store);

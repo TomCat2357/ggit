@@ -64,12 +64,15 @@ function Ggit_showModal(htmlStr, title, w, h) {
  * parent は「直線表示（クリック地点→ルート）」をクライアント側で辿るための第1親
  * （表示対象の親のみ。表示対象外＝壊れ/孤立の親は collectNodes 段階で落ちているので null）。
  */
-function Ggit_uiNode(node) {
+function Ggit_uiNode(node, mainAnc) {
   return {
     id: node.id, message: node.message, timestamp: node.timestamp, author: node.author,
     refs: node.refs || [], isWorking: !!node.isWorking, isStash: !!node.isStash,
     isHead: !!node.isHead, hasStash: !!node.hasStash, isBroken: !!node.isBroken,
-    parent: (node.parents && node.parents.length) ? node.parents[0] : null
+    revision: node.revision || null, // 固定したネイティブ版 { id, time }（無ければ null）
+    parent: (node.parents && node.parents.length) ? node.parents[0] : null,
+    // main ブックマーク以前（= main 祖先・自身）なら削除不可。UI で「枝を破棄」を出さない判定に使う。
+    protected: !!(mainAnc && mainAnc[node.id])
   };
 }
 
@@ -79,10 +82,18 @@ function Ggit_uiGraphData() {
   var store = Ggit_storeLoad(doc);
   var nodes = Ggit_collectNodes(store);
 
+  // main ブックマーク以前（祖先＋自身）＝削除保護対象。各ノードに protected を付ける。
+  var mc = store.bookmarks && store.bookmarks['main'];
+  var mainAnc = mc ? Ggit_ancestorSet(store, mc) : {};
+
   var rows = Ggit_graphLines(nodes).map(function (r) {
-    return { graph: r.graph, id: r.id, c: r.node ? Ggit_uiNode(r.node) : null };
+    return { graph: r.graph, id: r.id, c: r.node ? Ggit_uiNode(r.node, mainAnc) : null };
   });
-  var flat = nodes.map(Ggit_uiNode);
+  var rowsSimplified = Ggit_graphLinesSimplified(nodes).map(function (r) {
+    return { graph: r.graph, id: r.id, c: r.node ? Ggit_uiNode(r.node, mainAnc) : null,
+             elided: !!r.elided, count: r.count || 0 };
+  });
+  var flat = nodes.map(function (n) { return Ggit_uiNode(n, mainAnc); });
   var bookmarks = [];
   for (var name in store.bookmarks) {
     if (store.bookmarks.hasOwnProperty(name)) bookmarks.push({ name: name, commitId: store.bookmarks[name] });
@@ -92,10 +103,32 @@ function Ggit_uiGraphData() {
   var workingBroken = !!(working && store.objects.hasOwnProperty(working) &&
     !Ggit_canMaterialize(store, working));
   return {
-    rows: rows, flat: flat, working: working,
+    rows: rows, rows_simplified: rowsSimplified, flat: flat, working: working,
     bookmarks: bookmarks, stashes: Ggit_listStashes(store),
-    disconnected: disconnected, workingBroken: workingBroken
+    disconnected: disconnected, workingBroken: workingBroken,
+    docUrl: 'https://docs.google.com/document/d/' + doc.getId() + '/edit'
   };
+}
+
+/**
+ * 「祖先グラフ」モード用データ: 指定コミット（log 画面の選択行、無ければ現在地 @）の祖先だけを、
+ * マージで取り込んだ枝（第2親側）も含めてレーングラフ化した行を返す。直線表示（第1親のみの一覧）とは
+ * 別モードで、選択コミットが変わるたびにクライアントから呼ばれる（startId が描画の起点）。
+ * 返り値は Ggit_uiGraphData の rows と同形 [{graph,id,c}]。startId 不在なら空配列（UI 側で案内表示）。
+ */
+function Ggit_uiAncestorGraph(startId) {
+  var doc = DocumentApp.getActiveDocument();
+  var store = Ggit_storeLoad(doc);
+  var nodes = Ggit_collectNodes(store);
+
+  // main ブックマーク以前（祖先＋自身）＝削除保護対象。uiNode の protected 判定に使う（uiGraphData と同じ）。
+  var mc = store.bookmarks && store.bookmarks['main'];
+  var mainAnc = mc ? Ggit_ancestorSet(store, mc) : {};
+
+  var sub = Ggit_ancestorNodes(nodes, startId);
+  return Ggit_graphLines(sub).map(function (r) {
+    return { graph: r.graph, id: r.id, c: r.node ? Ggit_uiNode(r.node, mainAnc) : null };
+  });
 }
 
 /** goto のセレクタ用: ブックマーク＋コミット＋現在地。 */
@@ -212,7 +245,19 @@ function ggitUI_log() {
     '.gg .pr{margin-bottom:8px}' +
     '.gg .lbl{color:#555;margin-right:4px}' +
     '.gg .bmlist{margin-left:8px}' +
-    '.gg .diffout{border:1px solid #ddd;padding:8px;min-height:60px;max-height:240px;white-space:pre-wrap;font-family:monospace;overflow:auto;margin-top:6px}' +
+    '.gg .diffout{border:1px solid #ddd;padding:8px;min-height:60px;max-height:240px;overflow:auto;margin-top:6px;font-family:monospace;font-size:12px}' +
+    '.gg .rdo{margin-right:6px}' +
+    '.gg .revinfo{margin:4px 0;min-height:18px}' +
+    '.gg .difftbl{border-collapse:collapse;width:100%;table-layout:fixed}' +
+    '.gg .difftbl th{position:sticky;top:0;background:#f1f3f4;border:1px solid #e0e0e0;padding:2px 6px;text-align:left;font-weight:bold;width:50%}' +
+    '.gg .difftbl td.dcell{border:1px solid #eee;padding:1px 6px;vertical-align:top;white-space:pre-wrap;word-break:break-word}' +
+    '.gg .difftbl td.ddel{background:#ffe6e6}' +
+    '.gg .difftbl td.dins{background:#e6ffe6}' +
+    '.gg .difftbl td.dempty{background:#fafafa}' +
+    '.gg .diffstack .dln{white-space:pre-wrap;word-break:break-word;padding:0 4px}' +
+    '.gg .diffstack .ddel{background:#ffe6e6}' +
+    '.gg .diffstack .dins{background:#e6ffe6}' +
+    '.gg .diffstack .deq{color:#444}' +
     '</style>';
 
   var body =
@@ -220,7 +265,9 @@ function ggitUI_log() {
     '<div id="broken" class="broken"></div>' +
     '<div class="bar">' +
     '<button id="bGraph">グラフ</button> ' +
-    '<button id="bFlat">フラット</button>' +
+    '<button id="bFlat">フラット</button> ' +
+    '<button id="bSimplified">簡略</button> ' +
+    '<button id="bAnc" title="選択コミット（無ければ現在地 @）からルートまでの祖先を、マージで取り込んだ枝も含めてグラフ表示します">祖先グラフ</button>' +
     '<label class="lin"><input type="checkbox" id="linear"> 直線表示（選択地点→ルートだけ）</label>' +
     '<button id="bGc" class="gc" style="display:none"></button>' +
     '</div>' +
@@ -228,13 +275,18 @@ function ggitUI_log() {
     '<div class="help">' +
     '行をクリックするとそのコミットを<b>選択</b>します（下の操作と「直線表示」の対象になります）。' +
     'スタッシュ行は選択対象外です（下の一覧で「戻す(pop)」/「破棄」）。' +
-    'コミットは @ を移しても消えません（匿名ヘッドとして残る）。不要な枝は葉の「破棄」で削除、' +
+    'コミットは @ を移しても消えません（匿名ヘッドとして残る）。不要な枝は行の「枝を破棄」で' +
+    'そのコミットと全ての子孫だけをまとめて削除（@ が枝内なら根本の親へ移動）。' +
+    'main ブックマークが消える枝（main とその祖先）は削除できません。' +
     '復元できない壊れたコミットは非表示で「掃除」で削除できます。' +
+    '「祖先グラフ」は選択コミット（無ければ @）からルートまでを<b>マージで取り込んだ枝も含めて</b>グラフ表示します' +
+    '（直線表示は第1親だけを一覧にします）。' +
     '<code>&lt;name&gt;</code>=ブックマーク, <code>@</code>=現在地, <code>[stash]</code>=スタッシュ。</div>' +
     '<div id="list" class="list">読み込み中…</div>' +
     '<div id="stashes"></div>' +
     '<div class="panel">' +
     '<div class="ph">操作 <span id="selInfo" class="selinfo"></span></div>' +
+    '<div id="revInfo" class="revinfo"></div>' +
     '<div class="pr">' +
     '<button id="opGoto">移動(goto)</button> ' +
     '<button id="opMerge">＠へマージ</button></div>' +
@@ -242,16 +294,22 @@ function ggitUI_log() {
     '<input id="bmName" type="text" placeholder="main など" /> ' +
     '<button id="opBmSet">設定</button>' +
     '<span id="bmList" class="bmlist"></span></div>' +
-    '<div class="pr"><span class="lbl">diff:</span>' +
-    'A <input id="dFilterA" type="text" placeholder="A絞り込み（ID・メッセージ）" style="width:150px" /> <select id="dA"></select> ' +
-    'B <input id="dFilterB" type="text" placeholder="B絞り込み（ID・メッセージ）" style="width:150px" /> <select id="dB"></select> ' +
+    '<div class="pr"><span class="lbl">diff:</span> ' +
+    '<label class="rdo"><input type="radio" name="dLayout" value="side" checked> 左右（A | B）</label>' +
+    '<label class="rdo"><input type="radio" name="dLayout" value="stack"> 上下（A上/B下）</label> ' +
     '<button id="opDiff">差分表示</button></div>' +
+    '<div class="pr"><span class="lbl">A:</span> ' +
+    '<input id="dFilterA" type="text" placeholder="A絞り込み（ID・メッセージ）" style="width:150px" /> <select id="dA"></select></div>' +
+    '<div class="pr"><span class="lbl">B:</span> ' +
+    '<input id="dFilterB" type="text" placeholder="B絞り込み（ID・メッセージ）" style="width:150px" /> <select id="dB"></select></div>' +
     '<div id="diffOut" class="diffout"></div>' +
     '</div>';
 
   var script =
     '<script>' +
-    'var DATA=null,VIEW="graph",LINEAR=false,SEL=null;' +
+    'var DATA=null,VIEW="graph",LINEAR=false,SEL=null,DIFFDATA=null;' +
+    'var ANCROWS=null,ANCFOR=null,ANCREQ=null;' + // 祖先グラフ: 取得済み行 / 起点ID / 取得中の起点ID
+
     'function el(id){return document.getElementById(id);}' +
     'function setStatus(m,err){var d=el("status");d.style.color=err?"#d93025":"#188038";d.textContent=m||"";}' +
     'function onErr(e){setStatus(e.message||String(e),true);}' +
@@ -262,6 +320,14 @@ function ggitUI_log() {
     'return s;}' +
     'function nodeMap(){var m={};if(DATA&&DATA.flat){for(var i=0;i<DATA.flat.length;i++)m[DATA.flat[i].id]=DATA.flat[i];}return m;}' +
     'function chain(start){var m=nodeMap(),out=[],id=start,g=0;while(id&&m[id]&&g<100000){out.push(m[id]);id=m[id].parent;g++;}return out;}' +
+    // 祖先グラフ: 起点 start の祖先（マージの枝込み）をサーバで描画して取得。起点ごとにキャッシュし、
+    // 古い応答（起点が変わった後に届いたもの）は破棄する。レーン描画は Ggit_graphLines を再利用するため
+    // 行をクライアントで組み立てずサーバ側で受け取る。
+    'function fetchAncGraph(start){if(ANCREQ===start)return;ANCREQ=start;' +
+    'google.script.run.withSuccessHandler(function(rows){if(ANCREQ===start)ANCREQ=null;' +
+    'if((SEL||(DATA&&DATA.working))!==start)return;' + // 起点が変わっていたら破棄
+    'ANCFOR=start;ANCROWS=rows;if(VIEW==="ancestors"&&!LINEAR)renderList();})' +
+    '.withFailureHandler(function(e){if(ANCREQ===start)ANCREQ=null;onErr(e);}).Ggit_uiAncestorGraph(start);}' +
     'function commitList(){var out=[];if(DATA&&DATA.flat){for(var i=0;i<DATA.flat.length;i++){if(!DATA.flat[i].isStash)out.push(DATA.flat[i]);}}return out;}' +
     'function span(cls,txt){var s=document.createElement("span");if(cls)s.className=cls;s.textContent=txt;return s;}' +
     'function txt(t){return document.createTextNode(t);}' +
@@ -273,9 +339,9 @@ function ggitUI_log() {
     'td.appendChild(txt("  "+(c.message||"")+"  "));' +
     'td.appendChild(span("author",c.author||""));td.appendChild(txt("  "));' +
     'td.appendChild(span("time",fmtTime(c.timestamp)));' +
-    'if(c.isHead&&!c.isWorking&&!c.isStash){td.appendChild(txt(" "));' +
-    'var b=document.createElement("button");b.className="warn";b.textContent="破棄";b.title="この葉コミットの枝を破棄";' +
-    'b.setAttribute("data-act","abandon");b.setAttribute("data-id",c.id);b.setAttribute("data-hasstash",c.hasStash?"1":"0");' +
+    'if(!c.isStash&&!c.protected){td.appendChild(txt(" "));' +
+    'var b=document.createElement("button");b.className="warn";b.textContent="枝を破棄";b.title="このコミットと全ての子孫を削除";' +
+    'b.setAttribute("data-act","delsubtree");b.setAttribute("data-id",c.id);b.setAttribute("data-hasstash",c.hasStash?"1":"0");' +
     'td.appendChild(b);}}' +
     'function makeRow(c,graph){var tr=document.createElement("tr");' +
     'if(graph!=null){var g=document.createElement("td");g.className="g";g.textContent=graph;tr.appendChild(g);}' +
@@ -289,7 +355,14 @@ function ggitUI_log() {
     'if(!start){host.appendChild(helpDiv("直線表示の起点がありません（行を選択するか、Commit で現在地 @ を作成してください）。"));return;}' +
     'var ch=chain(start);if(!ch.length){host.appendChild(helpDiv("表示できるコミットがありません。"));return;}' +
     'for(i=0;i<ch.length;i++)table.appendChild(makeRow(ch[i],null));host.appendChild(table);return;}' +
-    'if(VIEW==="graph"){var rows=DATA.rows||[];if(!rows.length){host.appendChild(helpDiv("コミットがありません。"));return;}' +
+    'if(VIEW==="ancestors"){var as=SEL||DATA.working;' +
+    'if(!as){host.appendChild(helpDiv("祖先グラフの起点がありません（行を選択するか、Commit で現在地 @ を作成してください）。"));return;}' +
+    'if(ANCFOR!==as){host.appendChild(helpDiv("計算中…"));fetchAncGraph(as);return;}' +
+    'var ar=ANCROWS||[];if(!ar.length){host.appendChild(helpDiv("表示できるコミットがありません。"));return;}' +
+    'for(i=0;i<ar.length;i++)table.appendChild(makeRow(ar[i].c,ar[i].graph));host.appendChild(table);return;}' +
+    'if(VIEW==="simplified"){var sr=DATA.rows_simplified||[];if(!sr.length){host.appendChild(helpDiv("コミットがありません。"));return;}' +
+    'for(i=0;i<sr.length;i++)table.appendChild(makeRow(sr[i].c,sr[i].graph));}' +
+    'else if(VIEW==="graph"){var rows=DATA.rows||[];if(!rows.length){host.appendChild(helpDiv("コミットがありません。"));return;}' +
     'for(i=0;i<rows.length;i++)table.appendChild(makeRow(rows[i].c,rows[i].graph));}' +
     'else{var f=DATA.flat||[];if(!f.length){host.appendChild(helpDiv("コミットがありません。"));return;}' +
     'for(i=0;i<f.length;i++)table.appendChild(makeRow(f[i],null));}' +
@@ -330,13 +403,14 @@ function ggitUI_log() {
     'function renderDiffSelectors(){fillSelect(el("dA"),diffDefA(),"dFilterA");fillSelect(el("dB"),diffDefB(),"dFilterB");}' +
     'function renderPanelSel(){el("selInfo").textContent=SEL?("選択: "+SEL):"（行をクリックして選択）";' +
     'if(el("dA"))el("dA").value=diffDefA();if(el("dB"))el("dB").value=diffDefB();' +
-    'var has=!!SEL;el("opGoto").disabled=!has;el("opMerge").disabled=!has;el("opBmSet").disabled=!has;}' +
+    'var has=!!SEL;el("opGoto").disabled=!has;el("opMerge").disabled=!has;el("opBmSet").disabled=!has;renderRevInfo();}' +
     'function renderToolbar(){var dc=(DATA&&DATA.disconnected)||{total:0,orphans:0,broken:0};var gb=el("bGc");' +
     'if(dc.total>0){gb.style.display="";gb.textContent="掃除 ("+dc.total+")";gb.title="繋がりのなくなったコミット "+dc.total+" 件（孤立 "+dc.orphans+" / 壊れ "+dc.broken+"）を削除";}else{gb.style.display="none";}' +
     'el("broken").textContent=(DATA&&DATA.workingBroken)?"現在地 @ の内容を復元できません（壊れています）。メニューの「修復」で立て直してください。":"";' +
-    'el("bGraph").disabled=(VIEW==="graph")||LINEAR;el("bFlat").disabled=(VIEW==="flat")||LINEAR;el("linear").checked=LINEAR;}' +
+    'el("bGraph").disabled=(VIEW==="graph")||LINEAR;el("bFlat").disabled=(VIEW==="flat")||LINEAR;' +
+    'el("bSimplified").disabled=(VIEW==="simplified")||LINEAR;el("bAnc").disabled=(VIEW==="ancestors")||LINEAR;el("linear").checked=LINEAR;}' +
     'function renderAll(){renderHeader();renderToolbar();renderBookmarks();renderStashes();renderDiffSelectors();renderList();renderPanelSel();}' +
-    'function refresh(){google.script.run.withSuccessHandler(function(d){DATA=d;if(SEL&&!nodeMap()[SEL])SEL=null;renderAll();}).withFailureHandler(onErr).Ggit_uiGraphData();}' +
+    'function refresh(){google.script.run.withSuccessHandler(function(d){DATA=d;if(SEL&&!nodeMap()[SEL])SEL=null;ANCFOR=null;ANCROWS=null;ANCREQ=null;renderAll();}).withFailureHandler(onErr).Ggit_uiGraphData();}' +
     'function selectCommit(id){SEL=(SEL===id)?null:id;renderList();renderPanelSel();}' +
     'function setView(v){if(LINEAR)return;VIEW=v;renderToolbar();renderList();}' +
     'function toggleLinear(){LINEAR=el("linear").checked;renderToolbar();renderList();}' +
@@ -355,28 +429,57 @@ function ggitUI_log() {
     'function bmDelete(n){if(!confirm("ブックマーク「"+n+"」を削除します。よろしいですか？"))return;' +
     'google.script.run.withSuccessHandler(function(r){setStatus("ブックマーク「"+r.name+"」を削除しました。");refresh();}).withFailureHandler(onErr).Ggit_bookmarkDelete(n);}' +
     'function runDiff(){var a=el("dA").value,b=el("dB").value;if(!a||!b){setStatus("差分対象を選んでください",true);return;}' +
-    'var o=el("diffOut");o.textContent="計算中…";google.script.run.withSuccessHandler(function(h){o.innerHTML=h;}).withFailureHandler(function(e){o.textContent=e.message;}).Ggit_diffCommitsHtml(a,b);}' +
+    'var o=el("diffOut");o.textContent="計算中…";google.script.run.withSuccessHandler(function(d){DIFFDATA=d;renderDiff();}).withFailureHandler(function(e){DIFFDATA=null;o.textContent=e.message;}).Ggit_diffCommitsLines(a,b);}' +
+    'function diffLayout(){var r=document.getElementsByName("dLayout");for(var i=0;i<r.length;i++){if(r[i].checked)return r[i].value;}return "side";}' +
+    'function renderDiff(){var o=el("diffOut");o.innerHTML="";if(!DIFFDATA||!DIFFDATA.lines)return;var lines=DIFFDATA.lines;' +
+    'if(!lines.length){o.appendChild(helpDiv("差分はありません（内容は同一です）。"));return;}' +
+    'o.appendChild(diffLayout()==="stack"?renderStack(lines):renderSide(lines));}' +
+    'function renderStack(lines){var box=document.createElement("div");box.className="diffstack";' +
+    'for(var i=0;i<lines.length;i++){var ln=lines[i];var d=document.createElement("div");' +
+    'd.className="dln "+(ln.t==="del"?"ddel":(ln.t==="ins"?"dins":"deq"));' +
+    'd.textContent=(ln.t==="del"?"- ":(ln.t==="ins"?"+ ":"  "))+ln.s;box.appendChild(d);}return box;}' +
+    'function sideRows(lines){var rows=[],i=0,n=lines.length;' +
+    'while(i<n){if(lines[i].t==="eq"){rows.push({l:lines[i].s,r:lines[i].s,cl:"eq"});i++;}' +
+    'else{var dels=[],inss=[];while(i<n&&lines[i].t!=="eq"){if(lines[i].t==="del")dels.push(lines[i].s);else inss.push(lines[i].s);i++;}' +
+    'var m=Math.max(dels.length,inss.length);for(var k=0;k<m;k++){rows.push({l:k<dels.length?dels[k]:null,r:k<inss.length?inss[k]:null,cl:"chg"});}}}return rows;}' +
+    'function renderSide(lines){var rows=sideRows(lines);var tbl=document.createElement("table");tbl.className="difftbl";' +
+    'var hr=document.createElement("tr");var ha=document.createElement("th");ha.textContent="A（旧）";var hb=document.createElement("th");hb.textContent="B（新）";' +
+    'hr.appendChild(ha);hr.appendChild(hb);tbl.appendChild(hr);' +
+    'for(var i=0;i<rows.length;i++){var r=rows[i];var tr=document.createElement("tr");' +
+    'var td1=document.createElement("td");var td2=document.createElement("td");' +
+    'td1.className="dcell "+(r.l===null?"dempty":(r.cl==="chg"?"ddel":""));' +
+    'td2.className="dcell "+(r.r===null?"dempty":(r.cl==="chg"?"dins":""));' +
+    'td1.textContent=r.l===null?"":r.l;td2.textContent=r.r===null?"":r.r;' +
+    'tr.appendChild(td1);tr.appendChild(td2);tbl.appendChild(tr);}return tbl;}' +
+    'function renderRevInfo(){var host=el("revInfo");host.innerHTML="";if(!SEL)return;' +
+    'var n=nodeMap()[SEL];if(!n||!n.revision){host.appendChild(span("help","（このコミットには固定版がありません）"));return;}' +
+    'host.appendChild(txt("固定版: "));host.appendChild(span("time",fmtTime(n.revision.time)));host.appendChild(txt("  "));' +
+    'var a=document.createElement("a");a.textContent="変更履歴を開く";a.href=(DATA&&DATA.docUrl)||"#";a.target="_blank";a.rel="noopener";host.appendChild(a);' +
+    'host.appendChild(span("help","　その日時の版を選び「復元」で完全再現"));}' +
     'function popStash(id){if(!confirm("スタッシュ "+id+" の内容を現在のタブに戻し、このスタッシュを消します。よろしいですか？"))return;' +
     'setStatus("適用中…");google.script.run.withSuccessHandler(function(r){setStatus("スタッシュを戻して消しました"+(r.stashed?"（直前の内容を退避）":""));refresh();}).withFailureHandler(onErr).Ggit_popStash(id);}' +
     'function dropStash(id){if(!confirm("スタッシュ "+id+" を破棄します。元に戻せません。よろしいですか？"))return;' +
     'google.script.run.withSuccessHandler(function(){setStatus("スタッシュを破棄しました");refresh();}).withFailureHandler(onErr).Ggit_dropStash(id);}' +
-    'function abandon(id,hasStash){var m=hasStash?("コミット "+id+" には未コミット内容のスタッシュが付いています。\\n枝を破棄すると、その付随スタッシュも一緒に破棄されます（元に戻せません）。よろしいですか？"):("コミット "+id+" の枝を破棄します（葉から分岐元まで遡って削除）。\\n現在地 @ ・ブックマーク先・他の枝が乗る地点は残します。元に戻せません。よろしいですか？");if(!confirm(m))return;' +
-    'setStatus("破棄中…");google.script.run.withSuccessHandler(function(r){setStatus("破棄しました: "+r.removed+" 件削除"+(r.droppedStashes?("（スタッシュ "+r.droppedStashes+" 件も破棄）"):""));refresh();}).withFailureHandler(onErr).Ggit_abandonCommit(id);}' +
+    'function delSubtree(id,hasStash){var m="コミット "+id+" とその全ての子孫をまとめて削除します。"+(hasStash?"付随するスタッシュも一緒に破棄されます。":"")+"\\n削除する枝に現在地 @ が含まれる場合は、@ を枝の根本の親へ移し作業タブ本文もその版へ書き換えます。元に戻せません。よろしいですか？";if(!confirm(m))return;' +
+    'setStatus("削除中…");google.script.run.withSuccessHandler(function(r){setStatus("削除しました: "+r.removed+" 件"+(r.droppedStashes?("（スタッシュ "+r.droppedStashes+" 件も破棄）"):""));refresh();}).withFailureHandler(onErr).Ggit_deleteSubtree(id);}' +
     'function gc(){var dc=(DATA&&DATA.disconnected)||{total:0,orphans:0,broken:0};if(!dc.total)return;' +
     'if(!confirm("繋がりのなくなったコミット "+dc.total+" 件（孤立 "+dc.orphans+" / 壊れ "+dc.broken+"）を削除します。\\n現在地 @ は残します。元に戻せません。よろしいですか？"))return;' +
     'setStatus("掃除中…");google.script.run.withSuccessHandler(function(r){setStatus("掃除しました: "+r.removed+" 件削除（孤立 "+r.orphans+" / 壊れ "+r.broken+"）"+(r.workingBroken?" ※現在地 @ が壊れています。修復してください。":""));refresh();}).withFailureHandler(onErr).Ggit_gcDisconnected();}' +
     'el("bGraph").addEventListener("click",function(){setView("graph");});' +
     'el("bFlat").addEventListener("click",function(){setView("flat");});' +
+    'el("bSimplified").addEventListener("click",function(){setView("simplified");});' +
+    'el("bAnc").addEventListener("click",function(){setView("ancestors");});' +
     'el("linear").addEventListener("change",toggleLinear);' +
     'el("bGc").addEventListener("click",gc);' +
     'el("opGoto").addEventListener("click",goTo);' +
     'el("opMerge").addEventListener("click",mergeInto);' +
     'el("opBmSet").addEventListener("click",bmSet);' +
     'el("opDiff").addEventListener("click",runDiff);' +
+    'var dls=document.getElementsByName("dLayout");for(var dli=0;dli<dls.length;dli++)dls[dli].addEventListener("change",renderDiff);' +
     'el("dFilterA").addEventListener("input",refillDiffA);' +
     'el("dFilterB").addEventListener("input",refillDiffB);' +
     'el("list").addEventListener("click",function(e){var b=e.target.closest("button[data-act]");' +
-    'if(b){if(b.getAttribute("data-act")==="abandon")abandon(b.getAttribute("data-id"),b.getAttribute("data-hasstash")==="1");return;}' +
+    'if(b){if(b.getAttribute("data-act")==="delsubtree")delSubtree(b.getAttribute("data-id"),b.getAttribute("data-hasstash")==="1");return;}' +
     'var row=e.target.closest("tr[data-id]");if(row)selectCommit(row.getAttribute("data-id"));});' +
     'el("stashes").addEventListener("click",function(e){var b=e.target.closest("button[data-act]");if(!b)return;' +
     'var a=b.getAttribute("data-act");if(a==="pop")popStash(b.getAttribute("data-id"));else if(a==="drop")dropStash(b.getAttribute("data-id"));});' +
@@ -476,17 +579,21 @@ function ggitUI_about() {
     '<b>diff・bookmark・merge・移動(goto) は Log（グラフ）画面に統合</b>され、行を選択してその場で実行できます。<br><br>' +
     '<b>Jujutsu 流モデル</b>: 現在地 <code>@</code> はコミットID（匿名ヘッド）。commit は <code>@</code> を' +
     '前進させますが、<b>ブックマークは手動で set/move したときだけ動きます</b>。Log はブランチ（分岐）を' +
-    '意識した ASCII レーングラフで表示し、フラット表示・直線表示（選択地点→ルート）にも切替できます。<br><br>' +
+    '意識した ASCII レーングラフで表示し、フラット表示・簡略表示（jj 風に重要なコミットだけ残し連続を省略）・' +
+    '祖先グラフ（選択地点→ルートをマージの枝も含めてグラフ表示）・直線表示（選択地点→ルートを第1親だけ一覧）' +
+    'にも切替できます。<br><br>' +
     'スタッシュは <code>.vcs</code> の中に「<b>スタッシュだと分かる仮コミット（stash:true）</b>」として' +
     '記録され、戻す（pop）と消えます。<br><br>' +
     '初回は <b>「初期化（権限付与・.vcs作成）」</b>を実行してください。権限付与と <code>.vcs</code> 作成までを' +
     'これ1つで完結します。<br>' +
-    'commit は <code>@</code> を移しても消えず、<b>匿名ヘッド</b>として Log に残ります。不要な枝は葉の' +
-    '<b>「破棄」</b>で削除できます。内容を復元できない<b>壊れたコミット</b>だけは表示されず、' +
+    'commit は <code>@</code> を移しても消えず、<b>匿名ヘッド</b>として Log に残ります。不要な枝は行の' +
+    '<b>「枝を破棄」</b>でそのコミットと全ての子孫<b>だけ</b>をまとめて削除できます（<code>@</code> が枝内なら根本の親へ移動）。' +
+    '<b>main ブックマークが消える枝</b>（main とその祖先）は保護され削除できません。内容を復元できない<b>壊れたコミット</b>だけは表示されず、' +
     '<b>「掃除」</b>でまとめて削除できます（現在地 @ は残ります）。<br><br>' +
     'オブジェクトストアは <code>.vcs</code> メタタブに JSON で保存されます。<code>.vcs</code> タブは手動編集しないでください。<br>' +
-    'commit は本文の書式（文字・段落書式）も記録し、goto では書式ごと復元します。' +
-    '差分・マージはプレーンテキストを対象とします（設計仕様書 §7.3 / §7.4）。' +
+    'commit は本文を<b>完全テキストベース</b>で記録します（表は Markdown 化、書式は記録しません）。' +
+    '差分・マージはプレーンテキスト対象です。<b>書式・表・画像の完全な再現</b>は、各コミットに紐づけて' +
+    '固定したネイティブ版（変更履歴）の「復元」で行います（Log 画面で選択コミットの「変更履歴を開く」）。' +
     '</div>';
   Ggit_showModal(html, 'About ggit', 520, 340);
 }

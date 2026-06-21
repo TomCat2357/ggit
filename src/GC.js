@@ -183,3 +183,103 @@ function Ggit_abandonCommit(id) {
   if (r.removed.length || r.droppedStashes.length) Ggit_storeSave(doc, store);
   return { removed: r.removed.length, ids: r.removed, droppedStashes: r.droppedStashes.length };
 }
+
+/**
+ * id とその全子孫（parent/parent2 を下方向へ辿って到達するコミット＋付随スタッシュ）の集合
+ * { id:true } を返す純粋関数。「枝の根本を消したら全部消える」削除（Ggit_deleteSubtree）の対象。
+ */
+function Ggit_subtreeIds(store, id) {
+  var objects = store.objects || {};
+  var inSet = {};
+  var stack = [id];
+  inSet[id] = true;
+  while (stack.length) {
+    var cur = stack.pop();
+    for (var cid in objects) {
+      if (!objects.hasOwnProperty(cid) || inSet[cid]) continue;
+      var c = objects[cid];
+      if (c.parent === cur || c.parent2 === cur) { inSet[cid] = true; stack.push(cid); }
+    }
+  }
+  return inSet;
+}
+
+/**
+ * id とその全子孫だけを削除する純粋関数（store を破壊的に更新）。保存は呼び出し側。
+ * 戻り値: { removed:[id...], droppedStashes:[id...] }。
+ *
+ * 仕様:
+ *  - 対象 id は通常コミット（スタッシュは不可）。
+ *  - mainAnc は Ggit_ancestorSet(store, main)（main 無しなら {}）。mainAnc[id] のとき＝main が id の
+ *    子孫に含まれる（削除すると main ブックマークが消える）ため不可。DAG の性質上「id が main の祖先で
+ *    ない ⇒ id の子孫も main の祖先になり得ない」ので、保護判定は id 1点で足りる（parent2 経由のマージも
+ *    Ggit_ancestorSet が辿るため、側枝としてマージされた根本も正しく保護される）。
+ *  - 削除は id＋子孫のみ（下方向だけ）。上流（祖先）は一切刈らない＝「選んだコミットとその子孫だけ」が消える。
+ *  - id の子孫に付随するスタッシュも一緒に破棄し、消えたコミットを指すブックマーク等は後始末する。
+ */
+function Ggit_deleteSubtreeInStore(store, id, mainAnc) {
+  var objects = store.objects || {};
+  var victim = objects[id];
+  if (!victim) throw new Error('コミットが見つかりません: ' + id);
+  if (victim.stash) {
+    throw new Error('スタッシュは削除できません。スタッシュ一覧の「破棄」を使ってください。');
+  }
+  if (mainAnc && mainAnc[id]) {
+    throw new Error('main ブックマークが消えるため削除できません。');
+  }
+
+  var sub = Ggit_subtreeIds(store, id);
+  var removed = [], droppedStashes = [];
+  for (var did in sub) {
+    if (!sub.hasOwnProperty(did) || !objects[did]) continue;
+    if (objects[did].stash) droppedStashes.push(did); else removed.push(did);
+    delete objects[did];
+  }
+
+  Ggit_pruneDanglingRefs_(store);
+  return { removed: removed, droppedStashes: droppedStashes };
+}
+
+/**
+ * 「枝を破棄」エントリポイント（log モーダルのコミット行「枝を破棄」から呼ぶ）。
+ * 指定コミットとその全子孫を削除して `.vcs` を保存する（付随スタッシュも一緒に破棄）。
+ * 削除対象の枝に現在地 @ が含まれるときは、@ を枝の根本の親へ移し、作業タブ本文もその版へ
+ * 書き換えてから削除する（要望：「全部消える」体験。未コミット内容は枝ごと破棄するためスタッシュしない）。
+ * 戻り値: { removed, ids, droppedStashes }（removed・droppedStashes は件数）。
+ */
+function Ggit_deleteSubtree(id) {
+  var doc = DocumentApp.getActiveDocument();
+  var tab = doc.getActiveTab();
+  var meta = Ggit_metaTab(doc);
+  if (meta && tab.getId() === meta.getId()) {
+    throw new Error('.vcs メタタブ上では削除できません。対象のタブを選択してください。');
+  }
+
+  var store = Ggit_storeLoad(doc);
+  var objects = store.objects || {};
+  if (!objects[id]) throw new Error('コミットが見つかりません: ' + id);
+  if (objects[id].stash) {
+    throw new Error('スタッシュは削除できません。スタッシュ一覧の「破棄」を使ってください。');
+  }
+
+  var mc = store.bookmarks && store.bookmarks['main'];
+  var mainAnc = mc ? Ggit_ancestorSet(store, mc) : {};
+  if (mainAnc[id]) throw new Error('main ブックマークが消えるため削除できません。');
+
+  var sub = Ggit_subtreeIds(store, id);
+  if (store.working && sub[store.working]) {
+    // @ が削除対象の枝に含まれる → 根本の親（生存側）へ移し、タブ本文も差し替える。
+    var landing = (objects[id].parent && !sub[objects[id].parent]) ? objects[id].parent
+                : (mc && !sub[mc]) ? mc
+                : null;
+    if (!landing) {
+      throw new Error('削除後の現在地の移動先がありません。先に goto で枝の外へ移動してください。');
+    }
+    Ggit_restoreTab(tab, Ggit_materialize(store, landing)); // テキスト＋書式を入れ替え
+    store.working = landing;                                 // ※スタッシュはしない（枝ごと破棄）
+  }
+
+  var r = Ggit_deleteSubtreeInStore(store, id, mainAnc);
+  Ggit_storeSave(doc, store);
+  return { removed: r.removed.length, ids: r.removed, droppedStashes: r.droppedStashes.length };
+}
